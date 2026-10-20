@@ -101,3 +101,53 @@ pub struct SyncResponse {
     pub secrets: ListResponse<BaseSecret>,
     pub object: &'static str,
 }
+
+// --- request bodies ---
+
+#[derive(serde::Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct SecretCreateRequest {
+    pub key: String,
+    pub value: String,
+    #[serde(default)]
+    pub note: Option<String>,
+    #[serde(default)]
+    pub project_ids: Option<Vec<String>>,
+}
+
+#[derive(serde::Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct SecretUpdateRequest {
+    pub key: String,
+    pub value: String,
+    #[serde(default)]
+    pub note: Option<String>,
+    #[serde(default)]
+    pub project_ids: Option<Vec<String>>,
+}
+
+#[derive(serde::Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct GetByIdsRequest {
+    pub ids: Vec<String>,
+}
+
+#[derive(Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct BulkDeleteResponse {
+    pub id: String,
+    pub error: Option<String>,
+    pub object: &'static str,
+}
+
+#[derive(serde::Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ProjectCreateRequest {
+    pub name: String,
+}
+
+#[derive(serde::Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ProjectUpdateRequest {
+    pub name: String,
+}

@@ -364,4 +364,121 @@ mod tests {
 
         assert_eq!(resp.status(), Status::NotFound);
     }
+
+    #[test]
+    fn create_secret_then_visible_in_sync() {
+        let client = test_client("seccreate");
+        seed_project(client.rocket().state::<db::DbPool>().unwrap());
+        let token = obtain_token(&client);
+
+        let resp = client
+            .post(format!("/api/organizations/{ORG_ID}/secrets"))
+            .header(Header::new("Authorization", format!("Bearer {token}")))
+            .header(ContentType::JSON)
+            .body(format!(
+                r#"{{"key":"2.k|k|k","value":"2.v|v|v","note":"2.n|n|n","projectIds":["{PROJECT_ID}"]}}"#
+            ))
+            .dispatch();
+
+        assert_eq!(resp.status(), Status::Ok);
+        let body: serde_json::Value = resp.into_json().unwrap();
+        assert_eq!(body["object"], "secret");
+        assert_eq!(body["value"], "2.v|v|v");
+        let new_id = body["id"].as_str().unwrap().to_string();
+
+        let sync = client
+            .get(format!("/api/organizations/{ORG_ID}/secrets/sync"))
+            .header(Header::new("Authorization", format!("Bearer {token}")))
+            .dispatch();
+        let sbody: serde_json::Value = sync.into_json().unwrap();
+        let found = sbody["secrets"]["data"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|s| s["id"] == new_id);
+        assert!(found, "created secret should appear in sync");
+    }
+
+    #[test]
+    fn delete_secret_removes_from_sync() {
+        let client = test_client("secdelete");
+        let pool = client.rocket().state::<db::DbPool>().unwrap();
+        seed_project(pool);
+        seed_secret(pool);
+        let token = obtain_token(&client);
+
+        let resp = client
+            .post("/api/secrets/delete")
+            .header(Header::new("Authorization", format!("Bearer {token}")))
+            .header(ContentType::JSON)
+            .body(format!(r#"["{SECRET_ID}"]"#))
+            .dispatch();
+
+        assert_eq!(resp.status(), Status::Ok);
+        let body: serde_json::Value = resp.into_json().unwrap();
+        assert_eq!(body["data"][0]["id"], SECRET_ID);
+        assert!(body["data"][0]["error"].is_null());
+
+        let sync = client
+            .get(format!("/api/organizations/{ORG_ID}/secrets/sync"))
+            .header(Header::new("Authorization", format!("Bearer {token}")))
+            .dispatch();
+        let sbody: serde_json::Value = sync.into_json().unwrap();
+        assert_eq!(sbody["secrets"]["data"].as_array().unwrap().len(), 0);
+    }
+
+    // --- project CRUD ---
+
+    #[test]
+    fn create_project_then_listed_and_gettable() {
+        let client = test_client("projcreate");
+        let token = obtain_token(&client);
+
+        let resp = client
+            .post(format!("/api/organizations/{ORG_ID}/projects"))
+            .header(Header::new("Authorization", format!("Bearer {token}")))
+            .header(ContentType::JSON)
+            .body(r#"{"name":"2.p|p|p"}"#)
+            .dispatch();
+
+        assert_eq!(resp.status(), Status::Ok);
+        let body: serde_json::Value = resp.into_json().unwrap();
+        assert_eq!(body["object"], "project");
+        assert_eq!(body["write"], true);
+        let pid = body["id"].as_str().unwrap().to_string();
+
+        let got = client
+            .get(format!("/api/projects/{pid}"))
+            .header(Header::new("Authorization", format!("Bearer {token}")))
+            .dispatch();
+        assert_eq!(got.status(), Status::Ok);
+        let gbody: serde_json::Value = got.into_json().unwrap();
+        assert_eq!(gbody["id"], pid);
+    }
+
+    #[test]
+    fn delete_project_removes_from_list() {
+        let client = test_client("projdelete");
+        seed_project(client.rocket().state::<db::DbPool>().unwrap());
+        let token = obtain_token(&client);
+
+        let resp = client
+            .post("/api/projects/delete")
+            .header(Header::new("Authorization", format!("Bearer {token}")))
+            .header(ContentType::JSON)
+            .body(format!(r#"["{PROJECT_ID}"]"#))
+            .dispatch();
+
+        assert_eq!(resp.status(), Status::Ok);
+        let body: serde_json::Value = resp.into_json().unwrap();
+        assert_eq!(body["data"][0]["id"], PROJECT_ID);
+        assert!(body["data"][0]["error"].is_null());
+
+        let list = client
+            .get(format!("/api/organizations/{ORG_ID}/projects"))
+            .header(Header::new("Authorization", format!("Bearer {token}")))
+            .dispatch();
+        let lbody: serde_json::Value = list.into_json().unwrap();
+        assert_eq!(lbody["data"].as_array().unwrap().len(), 0);
+    }
 }
