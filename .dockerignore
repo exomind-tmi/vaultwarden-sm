@@ -1,0 +1,6 @@
+target
+data
+**/*.db
+**/*.sqlite3*
+.git
+*.key

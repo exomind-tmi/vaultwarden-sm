@@ -1,0 +1,21 @@
+# Example: run vaultwarden-sm next to vaultwarden on the same Docker network.
+# TLS is terminated by the reverse proxy in front (bws requires HTTPS); the
+# service itself speaks plain HTTP inside the network.
+services:
+  vaultwarden-sm:
+    build: .
+    container_name: vaultwarden-sm
+    restart: unless-stopped
+    environment:
+      DOMAIN: "https://sm.exomind-tmi.com" # used as the JWT issuer
+      DATA_DIR: "/data"
+      ROCKET_ADDRESS: "0.0.0.0"
+      ROCKET_PORT: "8080"
+      TZ: "Europe/Helsinki"
+    volumes:
+      - ./data:/data
+    networks: [vaultwarden-network]
+
+networks:
+  vaultwarden-network:
+    external: true
