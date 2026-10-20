@@ -1,6 +1,6 @@
-//! Crypto core: access-token parsing, key derivation, and wrapping/unwrapping of symmetric
-//! keys — wire-compatible with `bws` by construction, since it builds on the same
-//! `bitwarden-crypto` crate the official Bitwarden clients use.
+//! Crypto core: access-token parsing, key derivation, wrapping/unwrapping of symmetric keys,
+//! and token issuance — all wire-compatible with `bws` by construction, since it builds on the
+//! same `bitwarden-crypto` crate the official Bitwarden clients use.
 //!
 //! The algorithm mirrors the reference in Bitwarden's `util/RustSdk/rust/src/`
 //! (`sm_access_token.rs` and `crypto_util.rs`).
@@ -10,6 +10,8 @@ use bitwarden_crypto::{
     derive_shareable_key, BitwardenLegacyKeyBytes, EncString, KeyDecryptable, KeyEncryptable,
     SymmetricCryptoKey,
 };
+use rand::RngCore;
+use sha2::{Digest, Sha256};
 use zeroize::Zeroizing;
 
 #[derive(Debug, thiserror::Error)]
@@ -67,12 +69,16 @@ impl AccessToken {
     /// The AES-256-CBC-HMAC key derived from the 16-byte encryption key, exactly as the
     /// SDK/`bws` does: `derive_shareable_key(key16, "accesstoken", Some("sm-access-token"))`.
     pub fn derive_key(&self) -> SymmetricCryptoKey {
-        SymmetricCryptoKey::Aes256CbcHmacKey(derive_shareable_key(
-            Zeroizing::new(*self.encryption_key),
-            "accesstoken",
-            Some("sm-access-token"),
-        ))
+        derive_token_key(&self.encryption_key)
     }
+}
+
+fn derive_token_key(encryption_key: &[u8; 16]) -> SymmetricCryptoKey {
+    SymmetricCryptoKey::Aes256CbcHmacKey(derive_shareable_key(
+        Zeroizing::new(*encryption_key),
+        "accesstoken",
+        Some("sm-access-token"),
+    ))
 }
 
 /// Wrap a symmetric key (e.g. the org key) under `wrapping_key`, returning an `EncString`.
@@ -101,6 +107,65 @@ pub fn unwrap_key(
         .map_err(|_| CryptoError::Crypto)
 }
 
+/// Generate a fresh AES-256-CBC-HMAC organization key (32-byte enc + 32-byte MAC).
+pub fn generate_org_key() -> SymmetricCryptoKey {
+    let mut bytes = Zeroizing::new([0u8; 64]);
+    rand::thread_rng().fill_bytes(bytes.as_mut_slice());
+    SymmetricCryptoKey::try_from(&BitwardenLegacyKeyBytes::from(bytes.as_slice()))
+        .expect("64 random bytes form a valid AES-256-CBC-HMAC key")
+}
+
+/// The parts of a freshly issued access token.
+pub struct IssuedAccessToken {
+    /// `0.<id>.<client_secret>:<base64(encryption_key)>` — handed to the client, shown once.
+    pub token_string: String,
+    /// Base64(SHA256(client_secret)) — stored for authentication.
+    pub client_secret_hash: String,
+    /// Org key wrapped under the token key — stored and served back at token time.
+    pub encrypted_payload: String,
+    /// Token key wrapped under the org key — stored so an admin can recover it without the seed.
+    pub key_enc: String,
+}
+
+/// Issue a new access token for a machine account, given the organization key and a pre-chosen
+/// token id. Generates the encryption seed and client secret, and returns the token string plus
+/// the fields to persist.
+pub fn issue_access_token(
+    access_token_id: &str,
+    org_key: &SymmetricCryptoKey,
+) -> Result<IssuedAccessToken, CryptoError> {
+    let mut seed = Zeroizing::new([0u8; 16]);
+    rand::thread_rng().fill_bytes(seed.as_mut_slice());
+
+    let client_secret = random_secret(30);
+    let token_key = derive_token_key(&seed);
+
+    let encrypted_payload = wrap_key(org_key, &token_key)?;
+    let key_enc = wrap_key(&token_key, org_key)?;
+    let client_secret_hash = STANDARD.encode(Sha256::digest(client_secret.as_bytes()));
+    let token_string = format!(
+        "0.{}.{}:{}",
+        access_token_id,
+        client_secret,
+        STANDARD.encode(seed.as_slice())
+    );
+
+    Ok(IssuedAccessToken {
+        token_string,
+        client_secret_hash,
+        encrypted_payload,
+        key_enc,
+    })
+}
+
+fn random_secret(len: usize) -> String {
+    const CHARS: &[u8] = b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789";
+    let mut rng = rand::thread_rng();
+    (0..len)
+        .map(|_| CHARS[(rng.next_u32() as usize) % CHARS.len()] as char)
+        .collect()
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -122,5 +187,27 @@ mod tests {
         assert!(AccessToken::parse("1.id.secret:AAAA").is_err());
         assert!(AccessToken::parse("0.id.no-colon").is_err());
         assert!(AccessToken::parse("garbage").is_err());
+    }
+
+    #[test]
+    fn issued_token_round_trips_org_key() {
+        let org_key = generate_org_key();
+        let issued = issue_access_token("test-id-1234", &org_key).expect("issue");
+
+        // A client parsing the token string derives the same key that unwraps the payload.
+        let parsed = AccessToken::parse(&issued.token_string).expect("parse issued");
+        assert_eq!(parsed.id, "test-id-1234");
+
+        let token_key = parsed.derive_key();
+        let recovered = unwrap_key(&issued.encrypted_payload, &token_key).expect("unwrap payload");
+        assert_eq!(recovered.to_base64(), org_key.to_base64());
+
+        // The stored hash matches the secret embedded in the token string.
+        let expected_hash = STANDARD.encode(Sha256::digest(parsed.client_secret.as_bytes()));
+        assert_eq!(expected_hash, issued.client_secret_hash);
+
+        // key_enc recovers the token key via the org key (admin-recovery path).
+        let via_org = unwrap_key(&issued.key_enc, &org_key).expect("unwrap key_enc");
+        assert_eq!(via_org.to_base64(), token_key.to_base64());
     }
 }
