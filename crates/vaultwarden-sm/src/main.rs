@@ -481,4 +481,142 @@ mod tests {
         let lbody: serde_json::Value = list.into_json().unwrap();
         assert_eq!(lbody["data"].as_array().unwrap().len(), 0);
     }
+
+    // --- end to end ---
+
+    #[test]
+    fn end_to_end_issue_authenticate_recover_and_sync() {
+        let dir = std::env::temp_dir();
+        let db_path = dir.join("vwsm-test-e2e.db");
+        let pem_path = dir.join("vwsm-test-e2e.pem");
+        let _ = std::fs::remove_file(&db_path);
+        let _ = std::fs::remove_file(&pem_path);
+
+        let pool = db::init_pool(db_path.to_str().unwrap()).unwrap();
+        db::run_migrations(&pool).unwrap();
+
+        // Issue a real access token against a fresh org key.
+        let org_key = sm_core::crypto::generate_org_key();
+        let issued = sm_core::crypto::issue_access_token(TOKEN_ID, &org_key).unwrap();
+
+        {
+            use crate::schema::{
+                access_tokens, machine_account_project_access as mapa, machine_accounts,
+                organizations, project_secret, projects, secrets,
+            };
+            let mut conn = pool.get().unwrap();
+            let now = "2026-10-20T00:00:00Z".to_string();
+            diesel::insert_into(organizations::table)
+                .values(&Organization {
+                    id: ORG_ID.into(),
+                    name: "Org".into(),
+                    creation_date: now.clone(),
+                    revision_date: now.clone(),
+                })
+                .execute(&mut conn)
+                .unwrap();
+            diesel::insert_into(machine_accounts::table)
+                .values(&MachineAccount {
+                    id: MA_ID.into(),
+                    organization_id: ORG_ID.into(),
+                    name_enc: "2.x|y|z".into(),
+                    creation_date: now.clone(),
+                    revision_date: now.clone(),
+                })
+                .execute(&mut conn)
+                .unwrap();
+            diesel::insert_into(access_tokens::table)
+                .values(&AccessToken {
+                    id: TOKEN_ID.into(),
+                    machine_account_id: MA_ID.into(),
+                    name_enc: "2.x|y|z".into(),
+                    client_secret_hash: issued.client_secret_hash.clone(),
+                    scope: "[\"api.secrets\"]".into(),
+                    encrypted_payload: issued.encrypted_payload.clone(),
+                    key_enc: issued.key_enc.clone(),
+                    expire_at: None,
+                    creation_date: now.clone(),
+                    revision_date: now.clone(),
+                })
+                .execute(&mut conn)
+                .unwrap();
+            diesel::insert_into(projects::table)
+                .values(&Project {
+                    id: PROJECT_ID.into(),
+                    organization_id: ORG_ID.into(),
+                    name_enc: "2.p|p|p".into(),
+                    creation_date: now.clone(),
+                    revision_date: now.clone(),
+                    deleted_date: None,
+                })
+                .execute(&mut conn)
+                .unwrap();
+            diesel::insert_into(mapa::table)
+                .values(&MachineAccountProjectAccess {
+                    machine_account_id: MA_ID.into(),
+                    project_id: PROJECT_ID.into(),
+                    can_read: 1,
+                    can_write: 1,
+                })
+                .execute(&mut conn)
+                .unwrap();
+            diesel::insert_into(secrets::table)
+                .values(&Secret {
+                    id: SECRET_ID.into(),
+                    organization_id: ORG_ID.into(),
+                    key_enc: "2.k|k|k".into(),
+                    value_enc: "2.v|v|v".into(),
+                    note_enc: None,
+                    creation_date: now.clone(),
+                    revision_date: now.clone(),
+                    deleted_date: None,
+                })
+                .execute(&mut conn)
+                .unwrap();
+            diesel::insert_into(project_secret::table)
+                .values(&ProjectSecret {
+                    project_id: PROJECT_ID.into(),
+                    secret_id: SECRET_ID.into(),
+                })
+                .execute(&mut conn)
+                .unwrap();
+        }
+
+        let signer = jwt::JwtSigner::load_or_create(&pem_path, "http://localhost".into()).unwrap();
+        let client = Client::tracked(build_rocket(pool, signer)).unwrap();
+
+        // The client parses its own token string to get the secret and derive the token key.
+        let at = sm_core::crypto::AccessToken::parse(&issued.token_string).unwrap();
+
+        // 1) Authenticate.
+        let resp = client
+            .post("/identity/connect/token")
+            .header(ContentType::Form)
+            .body(format!(
+                "grant_type=client_credentials&client_id={TOKEN_ID}&client_secret={}",
+                at.client_secret
+            ))
+            .dispatch();
+        assert_eq!(resp.status(), Status::Ok);
+        let body: serde_json::Value = resp.into_json().unwrap();
+        let bearer = body["access_token"].as_str().unwrap().to_string();
+        let payload = body["encrypted_payload"].as_str().unwrap();
+
+        // 2) Recover the org key from the payload via the token key (as bws would).
+        let token_key = at.derive_key();
+        let recovered = sm_core::crypto::unwrap_key(payload, &token_key).unwrap();
+        assert_eq!(
+            recovered.to_base64().to_string(),
+            org_key.to_base64().to_string()
+        );
+
+        // 3) Use the bearer JWT to sync secrets.
+        let sync = client
+            .get(format!("/api/organizations/{ORG_ID}/secrets/sync"))
+            .header(Header::new("Authorization", format!("Bearer {bearer}")))
+            .dispatch();
+        assert_eq!(sync.status(), Status::Ok);
+        let sbody: serde_json::Value = sync.into_json().unwrap();
+        assert_eq!(sbody["secrets"]["data"][0]["id"], SECRET_ID);
+    }
 }
