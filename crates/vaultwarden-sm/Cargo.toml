@@ -1,0 +1,22 @@
+[package]
+name = "vaultwarden-sm"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+# Server: Rocket + Diesel API implementing the Secrets Manager slice bws needs.
+[[bin]]
+name = "vaultwarden-sm"
+path = "src/main.rs"
+
+[dependencies]
+sm-core = { path = "../sm-core" }
+diesel = { workspace = true }
+diesel_migrations = { workspace = true }
+libsqlite3-sys = { workspace = true } # bundled SQLite (statically linked)
+chrono = { workspace = true }
+uuid = { workspace = true }
+serde = { workspace = true }
+serde_json = { workspace = true }
+anyhow = { workspace = true }
+# rocket added in the server step.

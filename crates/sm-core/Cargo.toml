@@ -1,0 +1,12 @@
+[package]
+name = "sm-core"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+# Shared core: API DTOs and wrappers over bitwarden-crypto.
+[dependencies]
+bitwarden-crypto = { workspace = true }
+base64 = { workspace = true }
+zeroize = { workspace = true }
+thiserror = { workspace = true }

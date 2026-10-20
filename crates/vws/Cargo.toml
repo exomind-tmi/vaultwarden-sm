@@ -1,0 +1,15 @@
+[package]
+name = "vws"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+# Companion CLI: wraps `bws` entirely and adds the admin commands bws lacks
+# (machine accounts, access tokens, projects, org init).
+[[bin]]
+name = "vws"
+path = "src/main.rs"
+
+[dependencies]
+sm-core = { path = "../sm-core" }
+# clap and an http client added in the cli step.

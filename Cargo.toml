@@ -1,0 +1,39 @@
+[workspace]
+resolver = "2"
+members = ["crates/sm-core", "crates/vaultwarden-sm", "crates/vws"]
+
+[workspace.package]
+version = "0.1.0"
+edition = "2021"
+license = "GPL-3.0-only" # tribute to vaultwarden (also GPL-3.0)
+authors = ["Anton Hokkanen"]
+repository = "https://github.com/exomind-tmi/vaultwarden-sm"
+
+# Single source of truth for dependency versions; crates opt in via `{ workspace = true }`.
+# Not everything is used yet — added as layers land.
+[workspace.dependencies]
+# --- web (same stack as vaultwarden) ---
+rocket = { version = "0.5.1", default-features = false, features = ["json"] }
+# --- data (same stack as vaultwarden) ---
+diesel = { version = "2.3.13", features = ["sqlite", "r2d2", "chrono"] }
+diesel_migrations = "2.3.2"
+libsqlite3-sys = { version = "0.38.2", features = ["bundled"] } # statically link SQLite into the binary
+# --- crypto: reuse the SAME crate Bitwarden clients use -> wire-compatible with bws for free ---
+bitwarden-crypto = { git = "https://github.com/bitwarden/sdk-internal.git", rev = "c5d5bba159bd222321f3ecfd90f5ae6192c2c8eb" }
+base64 = "0.22.1"
+zeroize = "1.8.2"
+# --- cli ---
+clap = { version = "4.5", features = ["derive"] }
+# --- shared ---
+serde = { version = "1.0.219", features = ["derive"] }
+serde_json = "1.0.141"
+jsonwebtoken = "9.3"
+uuid = { version = "1", features = ["v4"] }
+chrono = { version = "0.4", features = ["serde"] }
+anyhow = "1"
+thiserror = "2"
+
+[profile.release]
+codegen-units = 1
+lto = true
+opt-level = 3

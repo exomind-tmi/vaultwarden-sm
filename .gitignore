@@ -1,0 +1,8 @@
+/target
+**/*.rs.bk
+# локальные БД и секреты
+*.db
+*.sqlite3
+*.sqlite3-*
+.env
+*.key
