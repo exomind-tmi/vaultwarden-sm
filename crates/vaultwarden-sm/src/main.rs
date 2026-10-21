@@ -9,12 +9,20 @@ use std::path::PathBuf;
 use rocket::{Build, Rocket};
 
 /// Build the Rocket instance. Shared by `main` and the integration tests.
-pub fn build_rocket(pool: db::DbPool, signer: jwt::JwtSigner) -> Rocket<Build> {
+pub fn build_rocket(
+    pool: db::DbPool,
+    signer: jwt::JwtSigner,
+    admin_token: Option<String>,
+) -> Rocket<Build> {
     rocket::build()
         .manage(pool)
         .manage(signer)
+        .manage(api::admin::AdminConfig {
+            token: admin_token,
+        })
         .mount("/identity", api::identity::routes())
         .mount("/api", api::api_routes())
+        .mount("/admin", api::admin::routes())
 }
 
 #[rocket::main]
@@ -25,6 +33,9 @@ async fn main() -> anyhow::Result<()> {
     let domain = std::env::var("DOMAIN").unwrap_or_else(|_| "http://localhost".to_string());
     let rsa_key_path = PathBuf::from(&data_dir).join("rsa_key.pem");
 
+    // The admin token guards the `/admin` control plane `vws` uses. Unset => admin API disabled.
+    let admin_token = std::env::var("ADMIN_TOKEN").ok().filter(|t| !t.is_empty());
+
     std::fs::create_dir_all(&data_dir).ok();
 
     let pool = db::init_pool(&database_url)?;
@@ -32,7 +43,7 @@ async fn main() -> anyhow::Result<()> {
 
     let signer = jwt::JwtSigner::load_or_create(&rsa_key_path, domain)?;
 
-    build_rocket(pool, signer).launch().await?;
+    build_rocket(pool, signer, admin_token).launch().await?;
 
     Ok(())
 }
@@ -169,7 +180,24 @@ mod tests {
         db::run_migrations(&pool).unwrap();
         seed(&pool, "testsecret");
         let signer = jwt::JwtSigner::load_or_create(&pem_path, "http://localhost".into()).unwrap();
-        Client::tracked(build_rocket(pool, signer)).unwrap()
+        Client::tracked(build_rocket(pool, signer, None)).unwrap()
+    }
+
+    const ADMIN_TOKEN: &str = "test-admin-token";
+
+    /// A client with a fresh (empty) database and the admin API enabled. Used by admin tests,
+    /// which provision everything through `/admin` rather than seeding rows directly.
+    fn admin_client(uniq: &str) -> Client {
+        let dir = std::env::temp_dir();
+        let db_path = dir.join(format!("vwsm-admin-{uniq}.db"));
+        let pem_path = dir.join(format!("vwsm-admin-{uniq}.pem"));
+        let _ = std::fs::remove_file(&db_path);
+        let _ = std::fs::remove_file(&pem_path);
+
+        let pool = db::init_pool(db_path.to_str().unwrap()).unwrap();
+        db::run_migrations(&pool).unwrap();
+        let signer = jwt::JwtSigner::load_or_create(&pem_path, "http://localhost".into()).unwrap();
+        Client::tracked(build_rocket(pool, signer, Some(ADMIN_TOKEN.into()))).unwrap()
     }
 
     fn obtain_token(client: &Client) -> String {
@@ -583,7 +611,7 @@ mod tests {
         }
 
         let signer = jwt::JwtSigner::load_or_create(&pem_path, "http://localhost".into()).unwrap();
-        let client = Client::tracked(build_rocket(pool, signer)).unwrap();
+        let client = Client::tracked(build_rocket(pool, signer, None)).unwrap();
 
         // The client parses its own token string to get the secret and derive the token key.
         let at = sm_core::crypto::AccessToken::parse(&issued.token_string).unwrap();
@@ -604,7 +632,7 @@ mod tests {
 
         // 2) Recover the org key from the payload via the token key (as bws would).
         let token_key = at.derive_key();
-        let recovered = sm_core::crypto::unwrap_key(payload, &token_key).unwrap();
+        let recovered = sm_core::crypto::recover_org_key(payload, &token_key).unwrap();
         assert_eq!(
             recovered.to_base64().to_string(),
             org_key.to_base64().to_string()
@@ -618,5 +646,188 @@ mod tests {
         assert_eq!(sync.status(), Status::Ok);
         let sbody: serde_json::Value = sync.into_json().unwrap();
         assert_eq!(sbody["secrets"]["data"][0]["id"], SECRET_ID);
+    }
+
+    // --- admin API ---
+
+    fn admin_header() -> Header<'static> {
+        Header::new("Authorization", format!("Bearer {ADMIN_TOKEN}"))
+    }
+
+    #[test]
+    fn admin_requires_token() {
+        let client = admin_client("noauth");
+        // Missing bearer.
+        let resp = client.get("/admin/organizations").dispatch();
+        assert_eq!(resp.status(), Status::Unauthorized);
+        // Wrong bearer.
+        let resp = client
+            .get("/admin/organizations")
+            .header(Header::new("Authorization", "Bearer wrong"))
+            .dispatch();
+        assert_eq!(resp.status(), Status::Unauthorized);
+    }
+
+    #[test]
+    fn admin_disabled_without_configured_token() {
+        // test_client builds the rocket with admin_token = None.
+        let client = test_client("admindisabled");
+        let resp = client
+            .get("/admin/organizations")
+            .header(Header::new("Authorization", "Bearer anything"))
+            .dispatch();
+        assert_eq!(resp.status(), Status::ServiceUnavailable);
+    }
+
+    /// The full control-plane flow exactly as `vws` drives it: the admin (holding the org key
+    /// locally) provisions an org, a machine account, and an access token through `/admin`, then
+    /// a `bws`-style client authenticates, recovers the org key, and uses the SM API.
+    #[test]
+    fn admin_bootstrap_then_authenticate_and_use_sm_api() {
+        let client = admin_client("bootstrap");
+
+        // The admin generates the org key locally; the server never receives it in plaintext.
+        let org_key = sm_core::crypto::generate_org_key();
+        let org_id = uuid::Uuid::new_v4().to_string();
+        let ma_id = uuid::Uuid::new_v4().to_string();
+        let token_id = uuid::Uuid::new_v4().to_string();
+
+        // 1) Create organization.
+        let resp = client
+            .post("/admin/organizations")
+            .header(admin_header())
+            .header(ContentType::JSON)
+            .body(serde_json::json!({ "id": org_id, "name": "Acme" }).to_string())
+            .dispatch();
+        assert_eq!(resp.status(), Status::Ok);
+
+        // 2) Create machine account (name encrypted locally under the org key).
+        let ma_name_enc = sm_core::crypto::encrypt_str("ci-runner", &org_key).unwrap();
+        let resp = client
+            .post(format!("/admin/organizations/{org_id}/machine-accounts"))
+            .header(admin_header())
+            .header(ContentType::JSON)
+            .body(serde_json::json!({ "id": ma_id, "nameEnc": ma_name_enc }).to_string())
+            .dispatch();
+        assert_eq!(resp.status(), Status::Ok);
+
+        // 3) Issue an access token locally, then register its public parts with the server.
+        let issued = sm_core::crypto::issue_access_token(&token_id, &org_key).unwrap();
+        let token_name_enc = sm_core::crypto::encrypt_str("default", &org_key).unwrap();
+        let resp = client
+            .post(format!("/admin/machine-accounts/{ma_id}/access-tokens"))
+            .header(admin_header())
+            .header(ContentType::JSON)
+            .body(
+                serde_json::json!({
+                    "id": token_id,
+                    "nameEnc": token_name_enc,
+                    "clientSecretHash": issued.client_secret_hash,
+                    "encryptedPayload": issued.encrypted_payload,
+                    "keyEnc": issued.key_enc,
+                })
+                .to_string(),
+            )
+            .dispatch();
+        assert_eq!(resp.status(), Status::Ok);
+
+        // 4) The client authenticates with the token string (as bws does).
+        let at = sm_core::crypto::AccessToken::parse(&issued.token_string).unwrap();
+        let resp = client
+            .post("/identity/connect/token")
+            .header(ContentType::Form)
+            .body(format!(
+                "grant_type=client_credentials&client_id={token_id}&client_secret={}",
+                at.client_secret
+            ))
+            .dispatch();
+        assert_eq!(resp.status(), Status::Ok);
+        let body: serde_json::Value = resp.into_json().unwrap();
+        let bearer = body["access_token"].as_str().unwrap().to_string();
+        let payload = body["encrypted_payload"].as_str().unwrap();
+
+        // 5) Recover the org key from the payload — proves the round trip over the real wire.
+        let token_key = at.derive_key();
+        let recovered = sm_core::crypto::recover_org_key(payload, &token_key).unwrap();
+        assert_eq!(recovered.to_base64(), org_key.to_base64());
+
+        // 6) Create a project and a secret through the SM API, encrypting under the org key.
+        let proj_name_enc = sm_core::crypto::encrypt_str("prod", &org_key).unwrap();
+        let resp = client
+            .post(format!("/api/organizations/{org_id}/projects"))
+            .header(Header::new("Authorization", format!("Bearer {bearer}")))
+            .header(ContentType::JSON)
+            .body(serde_json::json!({ "name": proj_name_enc }).to_string())
+            .dispatch();
+        assert_eq!(resp.status(), Status::Ok);
+        let pbody: serde_json::Value = resp.into_json().unwrap();
+        let project_id = pbody["id"].as_str().unwrap().to_string();
+
+        let key_enc = sm_core::crypto::encrypt_str("DB_PASSWORD", &org_key).unwrap();
+        let value_enc = sm_core::crypto::encrypt_str("s3cr3t", &org_key).unwrap();
+        let resp = client
+            .post(format!("/api/organizations/{org_id}/secrets"))
+            .header(Header::new("Authorization", format!("Bearer {bearer}")))
+            .header(ContentType::JSON)
+            .body(
+                serde_json::json!({
+                    "key": key_enc,
+                    "value": value_enc,
+                    "note": "",
+                    "projectIds": [project_id],
+                })
+                .to_string(),
+            )
+            .dispatch();
+        assert_eq!(resp.status(), Status::Ok);
+
+        // 7) Sync and decrypt the secret value with the recovered org key.
+        let sync = client
+            .get(format!("/api/organizations/{org_id}/secrets/sync"))
+            .header(Header::new("Authorization", format!("Bearer {bearer}")))
+            .dispatch();
+        assert_eq!(sync.status(), Status::Ok);
+        let sbody: serde_json::Value = sync.into_json().unwrap();
+        let enc_value = sbody["secrets"]["data"][0]["value"].as_str().unwrap();
+        let decrypted = sm_core::crypto::decrypt_str(enc_value, &recovered).unwrap();
+        assert_eq!(decrypted, "s3cr3t");
+    }
+
+    #[test]
+    fn admin_grant_project_access_rejects_cross_org() {
+        let client = admin_client("crossorg");
+        let org_key = sm_core::crypto::generate_org_key();
+        let org_id = uuid::Uuid::new_v4().to_string();
+        let ma_id = uuid::Uuid::new_v4().to_string();
+
+        client
+            .post("/admin/organizations")
+            .header(admin_header())
+            .header(ContentType::JSON)
+            .body(serde_json::json!({ "id": org_id, "name": "Acme" }).to_string())
+            .dispatch();
+        let ma_name_enc = sm_core::crypto::encrypt_str("runner", &org_key).unwrap();
+        client
+            .post(format!("/admin/organizations/{org_id}/machine-accounts"))
+            .header(admin_header())
+            .header(ContentType::JSON)
+            .body(serde_json::json!({ "id": ma_id, "nameEnc": ma_name_enc }).to_string())
+            .dispatch();
+
+        // Granting access to a project that does not exist is a 404.
+        let resp = client
+            .post(format!("/admin/machine-accounts/{ma_id}/project-access"))
+            .header(admin_header())
+            .header(ContentType::JSON)
+            .body(
+                serde_json::json!({
+                    "projectId": uuid::Uuid::new_v4().to_string(),
+                    "read": true,
+                    "write": true,
+                })
+                .to_string(),
+            )
+            .dispatch();
+        assert_eq!(resp.status(), Status::NotFound);
     }
 }

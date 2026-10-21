@@ -1,5 +1,6 @@
 //! HTTP API: identity (token issuance) and the Secrets Manager routes.
 
+pub mod admin;
 pub mod auth;
 pub mod dto;
 pub mod identity;

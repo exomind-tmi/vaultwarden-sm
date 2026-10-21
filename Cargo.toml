@@ -13,7 +13,7 @@ repository = "https://github.com/exomind-tmi/vaultwarden-sm"
 # Not everything is used yet — added as layers land.
 [workspace.dependencies]
 # --- web (same stack as vaultwarden) ---
-rocket = { version = "0.5.1", default-features = false, features = ["json"] }
+rocket = { version = "0.5.1", default-features = false, features = ["json", "tls"] }
 # --- data (same stack as vaultwarden) ---
 diesel = { version = "2.3.13", features = ["sqlite", "r2d2", "chrono"] }
 diesel_migrations = "2.3.2"
@@ -24,6 +24,8 @@ base64 = "0.22.1"
 zeroize = "1.8.2"
 # --- cli ---
 clap = { version = "4.5", features = ["derive"] }
+# --- http client (vws -> admin API; rustls so it builds the same everywhere) ---
+reqwest = { version = "0.12", default-features = false, features = ["blocking", "json", "rustls-tls"] }
 # --- jwt / signing ---
 jsonwebtoken = "9.3"
 rsa = { version = "0.9", features = ["pem"] }
