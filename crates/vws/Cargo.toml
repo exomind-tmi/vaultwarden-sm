@@ -4,12 +4,17 @@ version.workspace = true
 edition.workspace = true
 license.workspace = true
 
-# Companion CLI: wraps `bws` entirely and adds the admin commands bws lacks
-# (machine accounts, access tokens, projects, org init).
+# Companion CLI: the admin control plane for vaultwarden-sm (organizations, machine accounts,
+# access tokens, project access) plus a transparent wrapper around `bws` for everything else.
 [[bin]]
 name = "vws"
 path = "src/main.rs"
 
 [dependencies]
 sm-core = { path = "../sm-core" }
-# clap and an http client added in the cli step.
+clap = { workspace = true, features = ["env"] }
+reqwest.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+uuid.workspace = true
+anyhow.workspace = true
