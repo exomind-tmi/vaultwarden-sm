@@ -10,9 +10,20 @@ use bitwarden_crypto::{
     derive_shareable_key, BitwardenLegacyKeyBytes, EncString, KeyDecryptable, KeyEncryptable,
     SymmetricCryptoKey,
 };
+use std::str::FromStr;
 use rand::RngCore;
+use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 use zeroize::Zeroizing;
+
+/// The decrypted shape of an access token's `encrypted_payload`, exactly as `bws` expects it:
+/// a JSON object whose `encryptionKey` is the base64 organization key. `bws` decrypts the payload
+/// with the token key, parses this, and base64-decodes `encryptionKey` into the org key.
+#[derive(Serialize, Deserialize)]
+struct AccessTokenPayload {
+    #[serde(rename = "encryptionKey")]
+    encryption_key: String,
+}
 
 #[derive(Debug, thiserror::Error)]
 pub enum CryptoError {
@@ -115,6 +126,36 @@ pub fn generate_org_key() -> SymmetricCryptoKey {
         .expect("64 random bytes form a valid AES-256-CBC-HMAC key")
 }
 
+/// Serialize a symmetric key to base64 (the form `vws` stores in its local profile).
+pub fn key_to_base64(key: &SymmetricCryptoKey) -> String {
+    key.to_base64().to_string()
+}
+
+/// Parse a base64 symmetric key, as produced by [`key_to_base64`].
+pub fn key_from_base64(key_b64: &str) -> Result<SymmetricCryptoKey, CryptoError> {
+    let bytes = STANDARD
+        .decode(key_b64)
+        .map_err(|_| CryptoError::InvalidKeyB64)?;
+    SymmetricCryptoKey::try_from(&BitwardenLegacyKeyBytes::from(bytes.as_slice()))
+        .map_err(|_| CryptoError::Crypto)
+}
+
+/// Encrypt a UTF-8 string under a symmetric key, returning an `EncString` (e.g. `2.iv|data|mac`).
+/// Used by `vws` to encrypt admin-facing labels (machine-account and token names) under the org key.
+pub fn encrypt_str(plaintext: &str, key: &SymmetricCryptoKey) -> Result<String, CryptoError> {
+    let enc = plaintext
+        .to_string()
+        .encrypt_with_key(key)
+        .map_err(|_| CryptoError::Crypto)?;
+    Ok(enc.to_string())
+}
+
+/// Decrypt an `EncString` string field back to UTF-8 (inverse of [`encrypt_str`]).
+pub fn decrypt_str(enc: &str, key: &SymmetricCryptoKey) -> Result<String, CryptoError> {
+    let parsed = EncString::from_str(enc).map_err(|_| CryptoError::Crypto)?;
+    parsed.decrypt_with_key(key).map_err(|_| CryptoError::Crypto)
+}
+
 /// The parts of a freshly issued access token.
 pub struct IssuedAccessToken {
     /// `0.<id>.<client_secret>:<base64(encryption_key)>` — handed to the client, shown once.
@@ -140,7 +181,13 @@ pub fn issue_access_token(
     let client_secret = random_secret(30);
     let token_key = derive_token_key(&seed);
 
-    let encrypted_payload = wrap_key(org_key, &token_key)?;
+    // bws expects the payload to decrypt to `{"encryptionKey":"<base64 org key>"}`, not a raw key.
+    let payload = AccessTokenPayload {
+        encryption_key: org_key.to_base64().to_string(),
+    };
+    let payload_json =
+        serde_json::to_string(&payload).map_err(|_| CryptoError::Crypto)?;
+    let encrypted_payload = encrypt_str(&payload_json, &token_key)?;
     let key_enc = wrap_key(&token_key, org_key)?;
     let client_secret_hash = STANDARD.encode(Sha256::digest(client_secret.as_bytes()));
     let token_string = format!(
@@ -156,6 +203,18 @@ pub fn issue_access_token(
         encrypted_payload,
         key_enc,
     })
+}
+
+/// Recover the organization key from an access token's `encrypted_payload`, exactly as `bws` does:
+/// decrypt with the token key, parse the JSON, and base64-decode `encryptionKey`.
+pub fn recover_org_key(
+    encrypted_payload: &str,
+    token_key: &SymmetricCryptoKey,
+) -> Result<SymmetricCryptoKey, CryptoError> {
+    let json = decrypt_str(encrypted_payload, token_key)?;
+    let payload: AccessTokenPayload =
+        serde_json::from_str(&json).map_err(|_| CryptoError::Crypto)?;
+    key_from_base64(&payload.encryption_key)
 }
 
 fn random_secret(len: usize) -> String {
@@ -190,6 +249,45 @@ mod tests {
     }
 
     #[test]
+    fn org_key_base64_round_trips() {
+        let org_key = generate_org_key();
+        let b64 = key_to_base64(&org_key);
+        let back = key_from_base64(&b64).expect("parse key");
+        assert_eq!(back.to_base64(), org_key.to_base64());
+    }
+
+    #[test]
+    fn string_encrypt_round_trips_under_key() {
+        let org_key = generate_org_key();
+        let enc = encrypt_str("machine-account-1", &org_key).expect("encrypt");
+        assert!(enc.starts_with("2."), "AES-256-CBC-HMAC EncString is type 2");
+        let back = decrypt_str(&enc, &org_key).expect("decrypt");
+        assert_eq!(back, "machine-account-1");
+    }
+
+    #[test]
+    fn encrypted_payload_matches_bws_contract() {
+        // bws decrypts encrypted_payload with the token key and parses it as
+        // `{"encryptionKey":"<base64 org key>"}`. Pin that exact shape so we never regress to a
+        // raw wrapped key (which makes bws fail with "expected value at line 1 column 1").
+        let org_key = generate_org_key();
+        let issued = issue_access_token("contract-id", &org_key).unwrap();
+        let parsed = AccessToken::parse(&issued.token_string).unwrap();
+        let token_key = parsed.derive_key();
+
+        let plaintext = decrypt_str(&issued.encrypted_payload, &token_key).unwrap();
+        let json: serde_json::Value = serde_json::from_str(&plaintext).unwrap();
+        let obj = json.as_object().unwrap();
+        assert_eq!(obj.len(), 1, "payload has exactly one field");
+        let enc_key = obj["encryptionKey"].as_str().unwrap();
+        assert_eq!(
+            enc_key,
+            org_key.to_base64().to_string(),
+            "encryptionKey is the base64 org key"
+        );
+    }
+
+    #[test]
     fn issued_token_round_trips_org_key() {
         let org_key = generate_org_key();
         let issued = issue_access_token("test-id-1234", &org_key).expect("issue");
@@ -199,7 +297,8 @@ mod tests {
         assert_eq!(parsed.id, "test-id-1234");
 
         let token_key = parsed.derive_key();
-        let recovered = unwrap_key(&issued.encrypted_payload, &token_key).expect("unwrap payload");
+        let recovered =
+            recover_org_key(&issued.encrypted_payload, &token_key).expect("recover org key");
         assert_eq!(recovered.to_base64(), org_key.to_base64());
 
         // The stored hash matches the secret embedded in the token string.
