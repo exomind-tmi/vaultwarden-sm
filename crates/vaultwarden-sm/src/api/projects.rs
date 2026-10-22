@@ -160,6 +160,10 @@ pub async fn create_project(
         use crate::schema::{machine_account_project_access as mapa, projects};
         let mut conn = pool.get()?;
 
+        // A federated user's organization has no row here until its first write — create it so the
+        // project's foreign key to `organizations` holds.
+        crate::db::ensure_org(&mut conn, &org_id)?;
+
         let id = uuid::Uuid::new_v4().to_string();
         let now = now_iso();
         let project = Project {
@@ -187,7 +191,10 @@ pub async fn create_project(
     })
     .await
     .map_err(|_| Status::InternalServerError)?
-    .map_err(|_| Status::InternalServerError)?;
+    .map_err(|e| {
+        eprintln!("create_project failed: {e}");
+        Status::InternalServerError
+    })?;
 
     Ok(Json(project_response(project, true, true)))
 }

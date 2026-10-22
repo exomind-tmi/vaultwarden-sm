@@ -278,6 +278,9 @@ pub async fn create_secret(
             use crate::schema::{project_secret, projects, secrets};
             let mut conn = pool.get()?;
 
+            // The federated user's org may have no row here yet; create it so the FK holds.
+            crate::db::ensure_org(&mut conn, &org_id)?;
+
             let access = principal.project_access(&mut conn)?;
             let writable: HashSet<String> = rights_in_org(&access, &org_id)
                 .into_iter()

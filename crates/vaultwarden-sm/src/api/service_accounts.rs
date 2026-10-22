@@ -180,6 +180,9 @@ pub async fn create_service_account(
         use crate::schema::machine_accounts;
         let mut conn = pool.get()?;
 
+        // The federated user's org may have no row here yet; create it so the FK holds.
+        crate::db::ensure_org(&mut conn, &org_id)?;
+
         let now = now_iso();
         let ma = MachineAccount {
             id: uuid::Uuid::new_v4().to_string(),
