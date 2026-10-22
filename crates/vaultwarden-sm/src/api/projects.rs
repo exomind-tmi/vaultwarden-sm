@@ -1,4 +1,8 @@
 //! Secrets Manager project routes: list, get, and CRUD.
+//!
+//! Access is resolved through [`crate::access`]: a machine account sees its explicitly granted
+//! projects; an organization Owner/Admin sees every project in the org; a regular member sees only
+//! projects granted by access policy. Denials return 404 so a caller cannot probe what exists.
 
 use std::collections::HashSet;
 
@@ -7,7 +11,7 @@ use rocket::http::Status;
 use rocket::serde::json::Json;
 use rocket::{get, post, put, routes, Route, State};
 
-use crate::api::auth::SmAuth;
+use crate::access::{rights_all, rights_in_org, Principal};
 use crate::api::dto::{
     BulkDeleteResponse, ListResponse, ProjectCreateRequest, ProjectResponse, ProjectUpdateRequest,
 };
@@ -44,25 +48,22 @@ fn project_response(p: Project, read: bool, write: bool) -> ProjectResponse {
 #[get("/organizations/<org_id>/projects")]
 pub async fn list_projects(
     org_id: String,
-    auth: SmAuth,
+    principal: Principal,
     pool: &State<DbPool>,
 ) -> Result<Json<ListResponse<ProjectResponse>>, Status> {
-    if auth.organization_id != org_id {
+    if principal.org_access(&org_id).is_none() {
         return Err(Status::NotFound);
     }
-
     let pool = pool.inner().clone();
-    let ma = auth.machine_account_id.clone();
 
     let rows = rocket::tokio::task::spawn_blocking(
-        move || -> anyhow::Result<Vec<(Project, i32, i32)>> {
-            use crate::schema::{machine_account_project_access as mapa, projects};
+        move || -> anyhow::Result<Vec<(Project, bool, bool)>> {
+            use crate::schema::projects;
             let mut conn = pool.get()?;
 
-            let access: Vec<MachineAccountProjectAccess> = mapa::table
-                .filter(mapa::machine_account_id.eq(&ma))
-                .load(&mut conn)?;
-            let ids: Vec<String> = access.iter().map(|a| a.project_id.clone()).collect();
+            let access = principal.project_access(&mut conn)?;
+            let rights = rights_in_org(&access, &org_id);
+            let ids: Vec<String> = rights.keys().cloned().collect();
 
             let projects: Vec<Project> = projects::table
                 .filter(
@@ -74,8 +75,8 @@ pub async fn list_projects(
 
             let mut out = Vec::new();
             for p in projects {
-                if let Some(a) = access.iter().find(|a| a.project_id == p.id) {
-                    out.push((p, a.can_read, a.can_write));
+                if let Some(r) = rights.get(&p.id) {
+                    out.push((p, r.read, r.write));
                 }
             }
             Ok(out)
@@ -87,7 +88,7 @@ pub async fn list_projects(
 
     let data = rows
         .into_iter()
-        .map(|(p, r, w)| project_response(p, r != 0, w != 0))
+        .map(|(p, r, w)| project_response(p, r, w))
         .collect();
 
     Ok(Json(ListResponse::new(data)))
@@ -96,29 +97,22 @@ pub async fn list_projects(
 #[get("/projects/<id>")]
 pub async fn get_project(
     id: String,
-    auth: SmAuth,
+    principal: Principal,
     pool: &State<DbPool>,
 ) -> Result<Json<ProjectResponse>, Status> {
     let pool = pool.inner().clone();
-    let ma = auth.machine_account_id.clone();
 
     let found = rocket::tokio::task::spawn_blocking(
-        move || -> anyhow::Result<Option<(Project, i32, i32)>> {
-            use crate::schema::{machine_account_project_access as mapa, projects};
+        move || -> anyhow::Result<Option<(Project, bool, bool)>> {
+            use crate::schema::projects;
             let mut conn = pool.get()?;
 
-            let access: Option<MachineAccountProjectAccess> = mapa::table
-                .filter(
-                    mapa::machine_account_id
-                        .eq(&ma)
-                        .and(mapa::project_id.eq(&id)),
-                )
-                .first(&mut conn)
-                .optional()?;
-            let Some(a) = access else {
+            let access = principal.project_access(&mut conn)?;
+            let rights = rights_all(&access);
+            let Some(r) = rights.get(&id) else {
                 return Ok(None);
             };
-            if a.can_read == 0 {
+            if !r.read {
                 return Ok(None);
             }
             let p: Option<Project> = projects::table
@@ -126,7 +120,7 @@ pub async fn get_project(
                 .filter(projects::deleted_date.is_null())
                 .first(&mut conn)
                 .optional()?;
-            Ok(p.map(|p| (p, a.can_read, a.can_write)))
+            Ok(p.map(|p| (p, r.read, r.write)))
         },
     )
     .await
@@ -134,7 +128,7 @@ pub async fn get_project(
     .map_err(|_| Status::InternalServerError)?;
 
     match found {
-        Some((p, r, w)) => Ok(Json(project_response(p, r != 0, w != 0))),
+        Some((p, r, w)) => Ok(Json(project_response(p, r, w))),
         None => Err(Status::NotFound),
     }
 }
@@ -142,15 +136,24 @@ pub async fn get_project(
 #[post("/organizations/<org_id>/projects", data = "<req>")]
 pub async fn create_project(
     org_id: String,
-    auth: SmAuth,
+    principal: Principal,
     req: Json<ProjectCreateRequest>,
     pool: &State<DbPool>,
 ) -> Result<Json<ProjectResponse>, Status> {
-    if auth.organization_id != org_id {
+    let Some(org) = principal.org_access(&org_id) else {
         return Err(Status::NotFound);
-    }
+    };
+    // A machine account creating a project grants itself access to it (as `bws` expects). An
+    // Owner/Admin needs no grant — they see everything. A regular member cannot create projects.
+    let self_grant_ma = match &principal {
+        Principal::Machine {
+            machine_account_id, ..
+        } => Some(machine_account_id.clone()),
+        Principal::User { .. } if org.is_admin => None,
+        Principal::User { .. } => return Err(Status::Forbidden),
+    };
+
     let pool = pool.inner().clone();
-    let ma = auth.machine_account_id.clone();
     let name = req.name.clone();
 
     let project = rocket::tokio::task::spawn_blocking(move || -> anyhow::Result<Project> {
@@ -170,15 +173,16 @@ pub async fn create_project(
         diesel::insert_into(projects::table)
             .values(&project)
             .execute(&mut conn)?;
-        // The creating machine account gets read/write on the new project.
-        diesel::insert_into(mapa::table)
-            .values(&MachineAccountProjectAccess {
-                machine_account_id: ma,
-                project_id: id,
-                can_read: 1,
-                can_write: 1,
-            })
-            .execute(&mut conn)?;
+        if let Some(ma) = self_grant_ma {
+            diesel::insert_into(mapa::table)
+                .values(&MachineAccountProjectAccess {
+                    machine_account_id: ma,
+                    project_id: id,
+                    can_read: 1,
+                    can_write: 1,
+                })
+                .execute(&mut conn)?;
+        }
         Ok(project)
     })
     .await
@@ -191,31 +195,22 @@ pub async fn create_project(
 #[put("/projects/<id>", data = "<req>")]
 pub async fn update_project(
     id: String,
-    auth: SmAuth,
+    principal: Principal,
     req: Json<ProjectUpdateRequest>,
     pool: &State<DbPool>,
 ) -> Result<Json<ProjectResponse>, Status> {
     let pool = pool.inner().clone();
-    let ma = auth.machine_account_id.clone();
     let name = req.name.clone();
 
     let project = rocket::tokio::task::spawn_blocking(move || -> anyhow::Result<Project> {
-        use crate::schema::{machine_account_project_access as mapa, projects};
+        use crate::schema::projects;
         let mut conn = pool.get()?;
 
-        let access: Option<MachineAccountProjectAccess> = mapa::table
-            .filter(
-                mapa::machine_account_id
-                    .eq(&ma)
-                    .and(mapa::project_id.eq(&id)),
-            )
-            .first(&mut conn)
-            .optional()?;
-        let Some(a) = access else {
-            anyhow::bail!("not found");
-        };
-        if a.can_write == 0 {
-            anyhow::bail!("no write access");
+        let access = principal.project_access(&mut conn)?;
+        let rights = rights_all(&access);
+        match rights.get(&id) {
+            Some(r) if r.write => {}
+            _ => anyhow::bail!("not found or no write access"),
         }
 
         let now = now_iso();
@@ -239,24 +234,24 @@ pub async fn update_project(
 
 #[post("/projects/delete", data = "<ids>")]
 pub async fn delete_projects(
-    auth: SmAuth,
+    principal: Principal,
     ids: Json<Vec<String>>,
     pool: &State<DbPool>,
 ) -> Result<Json<ListResponse<BulkDeleteResponse>>, Status> {
     let pool = pool.inner().clone();
-    let ma = auth.machine_account_id.clone();
     let ids = ids.into_inner();
 
     let out = rocket::tokio::task::spawn_blocking(
         move || -> anyhow::Result<Vec<BulkDeleteResponse>> {
-            use crate::schema::{machine_account_project_access as mapa, projects};
+            use crate::schema::projects;
             let mut conn = pool.get()?;
 
-            let writable: HashSet<String> = mapa::table
-                .filter(mapa::machine_account_id.eq(&ma).and(mapa::can_write.eq(1)))
-                .select(mapa::project_id)
-                .load::<String>(&mut conn)?
-                .into_iter()
+            let access = principal.project_access(&mut conn)?;
+            let rights = rights_all(&access);
+            let writable: HashSet<String> = rights
+                .iter()
+                .filter(|(_, r)| r.write)
+                .map(|(id, _)| id.clone())
                 .collect();
 
             let now = now_iso();

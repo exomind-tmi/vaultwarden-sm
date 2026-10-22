@@ -75,6 +75,24 @@ diesel::table! {
     }
 }
 
+diesel::table! {
+    user_project_access (user_id, project_id) {
+        user_id -> Text,
+        project_id -> Text,
+        can_read -> Integer,
+        can_write -> Integer,
+    }
+}
+
+diesel::table! {
+    user_machine_account_access (user_id, machine_account_id) {
+        user_id -> Text,
+        machine_account_id -> Text,
+        can_read -> Integer,
+        can_write -> Integer,
+    }
+}
+
 diesel::joinable!(machine_accounts -> organizations (organization_id));
 diesel::joinable!(access_tokens -> machine_accounts (machine_account_id));
 diesel::joinable!(projects -> organizations (organization_id));
@@ -88,4 +106,6 @@ diesel::allow_tables_to_appear_in_same_query!(
     secrets,
     project_secret,
     machine_account_project_access,
+    user_project_access,
+    user_machine_account_access,
 );

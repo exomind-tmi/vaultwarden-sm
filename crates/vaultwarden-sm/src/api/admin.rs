@@ -14,7 +14,7 @@ use rocket::{delete, get, post, routes, Route, State};
 use serde::{Deserialize, Serialize};
 use subtle::ConstantTimeEq;
 
-use crate::api::dto::ListResponse;
+use crate::api::dto::{ListResponse, ServiceAccountResponse};
 use crate::db::DbPool;
 use crate::models::{
     AccessToken, MachineAccount, MachineAccountProjectAccess, Organization, Project,
@@ -118,30 +118,6 @@ impl From<Organization> for OrgResponse {
 pub struct CreateMachineAccountRequest {
     pub id: String,
     pub name_enc: String,
-}
-
-#[derive(Serialize)]
-#[serde(rename_all = "camelCase")]
-pub struct MachineAccountResponse {
-    pub id: String,
-    pub organization_id: String,
-    pub name: String,
-    pub creation_date: String,
-    pub revision_date: String,
-    pub object: &'static str,
-}
-
-impl From<MachineAccount> for MachineAccountResponse {
-    fn from(m: MachineAccount) -> Self {
-        MachineAccountResponse {
-            id: m.id,
-            organization_id: m.organization_id,
-            name: m.name_enc,
-            creation_date: m.creation_date,
-            revision_date: m.revision_date,
-            object: "serviceAccount",
-        }
-    }
 }
 
 #[derive(Deserialize)]
@@ -273,7 +249,7 @@ pub async fn create_machine_account(
     org_id: String,
     req: Json<CreateMachineAccountRequest>,
     pool: &State<DbPool>,
-) -> Result<Json<MachineAccountResponse>, Status> {
+) -> Result<Json<ServiceAccountResponse>, Status> {
     let pool = pool.inner().clone();
     let req = req.into_inner();
 
@@ -313,7 +289,7 @@ pub async fn list_machine_accounts(
     _admin: AdminAuth,
     org_id: String,
     pool: &State<DbPool>,
-) -> Result<Json<ListResponse<MachineAccountResponse>>, Status> {
+) -> Result<Json<ListResponse<ServiceAccountResponse>>, Status> {
     let pool = pool.inner().clone();
     let rows = rocket::tokio::task::spawn_blocking(move || -> anyhow::Result<Vec<MachineAccount>> {
         use crate::schema::machine_accounts;

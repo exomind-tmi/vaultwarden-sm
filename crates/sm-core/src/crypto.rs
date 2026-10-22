@@ -178,7 +178,7 @@ pub fn issue_access_token(
     let mut seed = Zeroizing::new([0u8; 16]);
     rand::thread_rng().fill_bytes(seed.as_mut_slice());
 
-    let client_secret = random_secret(30);
+    let client_secret = random_client_secret();
     let token_key = derive_token_key(&seed);
 
     // bws expects the payload to decrypt to `{"encryptionKey":"<base64 org key>"}`, not a raw key.
@@ -189,7 +189,7 @@ pub fn issue_access_token(
         serde_json::to_string(&payload).map_err(|_| CryptoError::Crypto)?;
     let encrypted_payload = encrypt_str(&payload_json, &token_key)?;
     let key_enc = wrap_key(&token_key, org_key)?;
-    let client_secret_hash = STANDARD.encode(Sha256::digest(client_secret.as_bytes()));
+    let client_secret_hash = hash_client_secret(&client_secret);
     let token_string = format!(
         "0.{}.{}:{}",
         access_token_id,
@@ -215,6 +215,18 @@ pub fn recover_org_key(
     let payload: AccessTokenPayload =
         serde_json::from_str(&json).map_err(|_| CryptoError::Crypto)?;
     key_from_base64(&payload.encryption_key)
+}
+
+/// A fresh client secret — the `<client_secret>` part of an access token: 30 random alphanumerics,
+/// matching the length the SDK uses. The server only ever stores its hash ([`hash_client_secret`]).
+pub fn random_client_secret() -> String {
+    random_secret(30)
+}
+
+/// `Base64(SHA256(client_secret))` — the stored, verifiable form of a client secret. Both token
+/// issuance and the `connect/token` check go through this so the hashing never drifts between them.
+pub fn hash_client_secret(client_secret: &str) -> String {
+    STANDARD.encode(Sha256::digest(client_secret.as_bytes()))
 }
 
 fn random_secret(len: usize) -> String {

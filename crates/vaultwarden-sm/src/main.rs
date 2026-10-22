@@ -1,20 +1,29 @@
+mod access;
 mod api;
 mod db;
+mod federation;
 mod jwt;
+mod membership;
 mod models;
 mod schema;
 
 use std::path::PathBuf;
+use std::time::Duration;
 
 use rocket::{Build, Rocket};
 
-/// Build the Rocket instance. Shared by `main` and the integration tests.
+/// How long a resolved membership may be cached before vaultwarden is asked again.
+const MEMBERSHIP_TTL: Duration = Duration::from_secs(60);
+
+/// Build the Rocket instance. Shared by `main` and the integration tests. `federation` is `Some`
+/// when the user flow is enabled (vaultwarden key mounted); `None` leaves only the machine flow.
 pub fn build_rocket(
     pool: db::DbPool,
     signer: jwt::JwtSigner,
     admin_token: Option<String>,
+    federation: Option<federation::Federation>,
 ) -> Rocket<Build> {
-    rocket::build()
+    let mut rocket = rocket::build()
         .manage(pool)
         .manage(signer)
         .manage(api::admin::AdminConfig {
@@ -22,7 +31,12 @@ pub fn build_rocket(
         })
         .mount("/identity", api::identity::routes())
         .mount("/api", api::api_routes())
-        .mount("/admin", api::admin::routes())
+        .mount("/admin", api::admin::routes());
+
+    if let Some(federation) = federation {
+        rocket = rocket.manage(federation);
+    }
+    rocket
 }
 
 #[rocket::main]
@@ -41,11 +55,44 @@ async fn main() -> anyhow::Result<()> {
     let pool = db::init_pool(&database_url)?;
     db::run_migrations(&pool)?;
 
-    let signer = jwt::JwtSigner::load_or_create(&rsa_key_path, domain)?;
+    let signer = jwt::JwtSigner::load_or_create(&rsa_key_path, domain.clone())?;
 
-    build_rocket(pool, signer, admin_token).launch().await?;
+    let federation = load_federation(&domain);
+
+    build_rocket(pool, signer, admin_token, federation)
+        .launch()
+        .await?;
 
     Ok(())
+}
+
+/// Build the federation layer from the environment, or `None` (user flow disabled) when the
+/// vaultwarden RSA key is not configured or not readable. `domain` is the origin both services
+/// share (vaultwarden's login issuer is `"{domain}|login"`).
+///
+/// - `VAULTWARDEN_RSA_KEY_PATH`: path to vaultwarden's `rsa_key.pem`, mounted read-only.
+/// - `VAULTWARDEN_URL`: vaultwarden's internal base URL on the shared network (default
+///   `http://vaultwarden`), never the public domain.
+fn load_federation(domain: &str) -> Option<federation::Federation> {
+    let key_path = std::env::var("VAULTWARDEN_RSA_KEY_PATH").ok()?;
+    let vw_base =
+        std::env::var("VAULTWARDEN_URL").unwrap_or_else(|_| "http://vaultwarden".to_string());
+
+    match federation::Federation::load(
+        std::path::Path::new(&key_path),
+        domain,
+        &vw_base,
+        MEMBERSHIP_TTL,
+    ) {
+        Ok(fed) => {
+            eprintln!("federation enabled: verifying vaultwarden users via {key_path}");
+            Some(fed)
+        }
+        Err(e) => {
+            eprintln!("federation disabled: could not load vaultwarden key {key_path}: {e}");
+            None
+        }
+    }
 }
 
 #[cfg(test)]
@@ -180,7 +227,7 @@ mod tests {
         db::run_migrations(&pool).unwrap();
         seed(&pool, "testsecret");
         let signer = jwt::JwtSigner::load_or_create(&pem_path, "http://localhost".into()).unwrap();
-        Client::tracked(build_rocket(pool, signer, None)).unwrap()
+        Client::tracked(build_rocket(pool, signer, None, None)).unwrap()
     }
 
     const ADMIN_TOKEN: &str = "test-admin-token";
@@ -197,7 +244,7 @@ mod tests {
         let pool = db::init_pool(db_path.to_str().unwrap()).unwrap();
         db::run_migrations(&pool).unwrap();
         let signer = jwt::JwtSigner::load_or_create(&pem_path, "http://localhost".into()).unwrap();
-        Client::tracked(build_rocket(pool, signer, Some(ADMIN_TOKEN.into()))).unwrap()
+        Client::tracked(build_rocket(pool, signer, Some(ADMIN_TOKEN.into()), None)).unwrap()
     }
 
     fn obtain_token(client: &Client) -> String {
@@ -611,7 +658,7 @@ mod tests {
         }
 
         let signer = jwt::JwtSigner::load_or_create(&pem_path, "http://localhost".into()).unwrap();
-        let client = Client::tracked(build_rocket(pool, signer, None)).unwrap();
+        let client = Client::tracked(build_rocket(pool, signer, None, None)).unwrap();
 
         // The client parses its own token string to get the secret and derive the token key.
         let at = sm_core::crypto::AccessToken::parse(&issued.token_string).unwrap();
@@ -829,5 +876,260 @@ mod tests {
             )
             .dispatch();
         assert_eq!(resp.status(), Status::NotFound);
+    }
+
+    // --- federation (vaultwarden user) flow over HTTP ---
+
+    use jsonwebtoken::{Algorithm as JwtAlg, EncodingKey, Header as JwtHeader};
+    use rsa::pkcs1::{EncodeRsaPrivateKey, LineEnding as RsaLineEnding};
+    use rsa::RsaPrivateKey;
+
+    const FED_ORIGIN: &str = "https://vault.exomind-tmi.com";
+
+    #[derive(serde::Serialize)]
+    struct UserClaims {
+        iss: String,
+        sub: String,
+        email: String,
+        name: String,
+        nbf: i64,
+        exp: i64,
+    }
+
+    /// A fresh RSA key as PKCS#1 PEM — the shape vaultwarden persists in `rsa_key.pem`.
+    fn fed_key_pem() -> String {
+        let mut rng = rand::thread_rng();
+        let key = RsaPrivateKey::new(&mut rng, 2048).unwrap();
+        key.to_pkcs1_pem(RsaLineEnding::LF).unwrap().to_string()
+    }
+
+    /// Sign a vaultwarden-style user session token (RS256, login issuer) with the given key.
+    fn sign_user_token(pem: &str, sub: &str) -> String {
+        let now = chrono::Utc::now().timestamp();
+        let claims = UserClaims {
+            iss: format!("{FED_ORIGIN}|login"),
+            sub: sub.into(),
+            email: "u@example.com".into(),
+            name: "User".into(),
+            nbf: now - 10,
+            exp: now + 3600,
+        };
+        let enc = EncodingKey::from_rsa_pem(pem.as_bytes()).unwrap();
+        jsonwebtoken::encode(&JwtHeader::new(JwtAlg::RS256), &claims, &enc).unwrap()
+    }
+
+    /// Stand in for vaultwarden's `/api/accounts/profile`: answer every connection with the same
+    /// profile JSON (all the membership resolver reads) and close. The listener binds before the
+    /// port is returned, so the socket is accepting by the time the resolver calls it.
+    fn start_profile_stub(profile: String) -> String {
+        use std::io::{Read, Write};
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let port = listener.local_addr().unwrap().port();
+        std::thread::spawn(move || {
+            for stream in listener.incoming() {
+                let Ok(mut stream) = stream else { continue };
+                let mut buf = [0u8; 4096];
+                let _ = stream.read(&mut buf);
+                let resp = format!(
+                    "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
+                    profile.len(),
+                    profile
+                );
+                let _ = stream.write_all(resp.as_bytes());
+                let _ = stream.flush();
+            }
+        });
+        format!("http://127.0.0.1:{port}")
+    }
+
+    fn profile_json(sub: &str, org_type: i32) -> String {
+        format!(
+            r#"{{"object":"profile","id":"{sub}","organizations":[{{"id":"{ORG_ID}","type":{org_type},"status":2,"enabled":true}}]}}"#
+        )
+    }
+
+    /// A federation-enabled server with one org, one project and one machine account seeded, wired
+    /// to the given vaultwarden profile stub and verifying tokens with `pem`.
+    fn fed_client(uniq: &str, pem: &str, vw_base: &str) -> Client {
+        let dir = std::env::temp_dir();
+        let db_path = dir.join(format!("vwsm-fed-{uniq}.db"));
+        let signer_pem = dir.join(format!("vwsm-fed-signer-{uniq}.pem"));
+        let vw_pem = dir.join(format!("vwsm-fed-vwkey-{uniq}.pem"));
+        let _ = std::fs::remove_file(&db_path);
+        let _ = std::fs::remove_file(&signer_pem);
+        std::fs::write(&vw_pem, pem).unwrap();
+
+        let pool = db::init_pool(db_path.to_str().unwrap()).unwrap();
+        db::run_migrations(&pool).unwrap();
+
+        {
+            use crate::schema::{machine_accounts, organizations, projects};
+            let mut conn = pool.get().unwrap();
+            let now = "2026-10-22T00:00:00Z".to_string();
+            diesel::insert_into(organizations::table)
+                .values(&Organization {
+                    id: ORG_ID.into(),
+                    name: "Org".into(),
+                    creation_date: now.clone(),
+                    revision_date: now.clone(),
+                })
+                .execute(&mut conn)
+                .unwrap();
+            diesel::insert_into(projects::table)
+                .values(&Project {
+                    id: PROJECT_ID.into(),
+                    organization_id: ORG_ID.into(),
+                    name_enc: "2.p|p|p".into(),
+                    creation_date: now.clone(),
+                    revision_date: now.clone(),
+                    deleted_date: None,
+                })
+                .execute(&mut conn)
+                .unwrap();
+            diesel::insert_into(machine_accounts::table)
+                .values(&MachineAccount {
+                    id: MA_ID.into(),
+                    organization_id: ORG_ID.into(),
+                    name_enc: "2.m|m|m".into(),
+                    creation_date: now.clone(),
+                    revision_date: now,
+                })
+                .execute(&mut conn)
+                .unwrap();
+        }
+
+        let signer = jwt::JwtSigner::load_or_create(&signer_pem, "http://localhost".into()).unwrap();
+        let fed = federation::Federation::load(&vw_pem, FED_ORIGIN, vw_base, MEMBERSHIP_TTL).unwrap();
+        Client::tracked(build_rocket(pool, signer, None, Some(fed))).unwrap()
+    }
+
+    #[test]
+    fn federation_admin_user_flow_over_http() {
+        let pem = fed_key_pem();
+        let sub = "aaaaaaaa-1111-2222-3333-444444444444";
+        let vw = start_profile_stub(profile_json(sub, 1)); // type 1 = Admin
+        let client = fed_client("admin", &pem, &vw);
+        let token = sign_user_token(&pem, sub);
+        let bearer = Header::new("Authorization", format!("Bearer {token}"));
+
+        // Admin sees the seeded machine account.
+        let resp = client
+            .get(format!("/api/organizations/{ORG_ID}/service-accounts"))
+            .header(bearer.clone())
+            .dispatch();
+        assert_eq!(resp.status(), Status::Ok);
+        let body: serde_json::Value = resp.into_json().unwrap();
+        assert_eq!(body["data"][0]["id"], MA_ID);
+        assert_eq!(body["data"][0]["object"], "serviceAccount");
+
+        // Counts reflect the seed: one project, no secrets, one service account.
+        let resp = client
+            .get(format!("/api/organizations/{ORG_ID}/sm-counts"))
+            .header(bearer.clone())
+            .dispatch();
+        assert_eq!(resp.status(), Status::Ok);
+        let counts: serde_json::Value = resp.into_json().unwrap();
+        assert_eq!(counts["object"], "organizationCounts");
+        assert_eq!(counts["projects"], 1);
+        assert_eq!(counts["secrets"], 0);
+        assert_eq!(counts["serviceAccounts"], 1);
+
+        // Admin creates a service account.
+        let resp = client
+            .post(format!("/api/organizations/{ORG_ID}/service-accounts"))
+            .header(bearer.clone())
+            .header(ContentType::JSON)
+            .body(r#"{"name":"2.n|n|n"}"#)
+            .dispatch();
+        assert_eq!(resp.status(), Status::Ok);
+
+        // Grant a person read on the project, then read the policy back.
+        let grantee = "bbbbbbbb-5555-6666-7777-888888888888";
+        let resp = client
+            .put(format!("/api/projects/{PROJECT_ID}/access-policies/people"))
+            .header(bearer.clone())
+            .header(ContentType::JSON)
+            .body(format!(
+                r#"{{"userAccessPolicyRequests":[{{"granteeId":"{grantee}","read":true,"write":false}}]}}"#
+            ))
+            .dispatch();
+        assert_eq!(resp.status(), Status::Ok);
+
+        let resp = client
+            .get(format!("/api/projects/{PROJECT_ID}/access-policies/people"))
+            .header(bearer)
+            .dispatch();
+        assert_eq!(resp.status(), Status::Ok);
+        let pol: serde_json::Value = resp.into_json().unwrap();
+        assert_eq!(pol["object"], "projectPeopleAccessPolicies");
+        assert_eq!(pol["userAccessPolicies"][0]["organizationUserId"], grantee);
+        assert_eq!(pol["userAccessPolicies"][0]["read"], true);
+    }
+
+    #[test]
+    fn federation_member_user_flow_is_granular() {
+        let pem = fed_key_pem();
+        let sub = "cccccccc-1111-2222-3333-444444444444";
+        let vw = start_profile_stub(profile_json(sub, 2)); // type 2 = regular User (member)
+        let client = fed_client("member", &pem, &vw);
+
+        // Grant this member read+write on the seeded project (as an admin would via the policy API).
+        {
+            use crate::schema::user_project_access as upa;
+            let mut conn = client.rocket().state::<db::DbPool>().unwrap().get().unwrap();
+            diesel::insert_into(upa::table)
+                .values(&crate::models::UserProjectAccess {
+                    user_id: sub.into(),
+                    project_id: PROJECT_ID.into(),
+                    can_read: 1,
+                    can_write: 1,
+                })
+                .execute(&mut conn)
+                .unwrap();
+        }
+
+        let token = sign_user_token(&pem, sub);
+        let bearer = Header::new("Authorization", format!("Bearer {token}"));
+
+        // The member sees exactly the one granted project.
+        let resp = client
+            .get(format!("/api/organizations/{ORG_ID}/projects"))
+            .header(bearer.clone())
+            .dispatch();
+        assert_eq!(resp.status(), Status::Ok);
+        let body: serde_json::Value = resp.into_json().unwrap();
+        let ids: Vec<&str> = body["data"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|p| p["id"].as_str().unwrap())
+            .collect();
+        assert_eq!(ids, [PROJECT_ID]);
+
+        // No machine accounts are granted to this member, so the list is empty.
+        let resp = client
+            .get(format!("/api/organizations/{ORG_ID}/service-accounts"))
+            .header(bearer.clone())
+            .dispatch();
+        assert_eq!(resp.status(), Status::Ok);
+        let body: serde_json::Value = resp.into_json().unwrap();
+        assert_eq!(body["data"].as_array().unwrap().len(), 0);
+
+        // A member may create neither projects nor service accounts.
+        let resp = client
+            .post(format!("/api/organizations/{ORG_ID}/projects"))
+            .header(bearer.clone())
+            .header(ContentType::JSON)
+            .body(r#"{"name":"2.x|x|x"}"#)
+            .dispatch();
+        assert_eq!(resp.status(), Status::Forbidden);
+
+        let resp = client
+            .post(format!("/api/organizations/{ORG_ID}/service-accounts"))
+            .header(bearer)
+            .header(ContentType::JSON)
+            .body(r#"{"name":"2.x|x|x"}"#)
+            .dispatch();
+        assert_eq!(resp.status(), Status::Forbidden);
     }
 }

@@ -1,8 +1,8 @@
 //! Secrets Manager secret routes: list, get, sync, and CRUD.
 //!
-//! A machine account reaches secrets through the projects it can read; writing needs a project
-//! it can write. Denials return 404, not 403, so a token cannot even learn that a secret it may
-//! not see exists.
+//! A principal reaches secrets through the projects it can read; writing needs a project it can
+//! write. Access is resolved once per request via [`crate::access`]. Denials return 404, not 403,
+//! so a token cannot even learn that a secret it may not see exists.
 
 use std::collections::{HashMap, HashSet};
 
@@ -12,13 +12,13 @@ use rocket::http::Status;
 use rocket::serde::json::Json;
 use rocket::{get, post, put, routes, Route, State};
 
-use crate::api::auth::SmAuth;
+use crate::access::{rights_all, rights_in_org, Principal, Rights};
 use crate::api::dto::{
     BaseSecret, BulkDeleteResponse, GetByIdsRequest, ListResponse, ProjectRef, SecretCreateRequest,
     SecretListItem, SecretResponse, SecretUpdateRequest, SecretsListResponse, SyncResponse,
 };
 use crate::db::DbPool;
-use crate::models::{MachineAccountProjectAccess, Project, ProjectSecret, Secret};
+use crate::models::{Project, ProjectSecret, Secret};
 
 pub fn routes() -> Vec<Route> {
     routes![
@@ -36,15 +36,7 @@ fn now_iso() -> String {
     chrono::Utc::now().to_rfc3339_opts(chrono::SecondsFormat::Micros, true)
 }
 
-fn writable_project_ids(conn: &mut SqliteConnection, ma_id: &str) -> anyhow::Result<Vec<String>> {
-    use crate::schema::machine_account_project_access as mapa;
-    Ok(mapa::table
-        .filter(mapa::machine_account_id.eq(ma_id).and(mapa::can_write.eq(1)))
-        .select(mapa::project_id)
-        .load(conn)?)
-}
-
-/// Everything a machine account can reach, resolved once per request.
+/// Everything a principal can reach, resolved once per request from a project-rights map.
 struct Accessible {
     secrets: Vec<Secret>,
     secret_projects: HashMap<String, Vec<ProjectRef>>,
@@ -52,20 +44,20 @@ struct Accessible {
     projects: Vec<ProjectRef>,
 }
 
-fn load_accessible(conn: &mut SqliteConnection, ma_id: &str) -> anyhow::Result<Accessible> {
-    use crate::schema::{machine_account_project_access as mapa, project_secret, projects, secrets};
+fn load_accessible(
+    conn: &mut SqliteConnection,
+    rights: &HashMap<String, Rights>,
+) -> anyhow::Result<Accessible> {
+    use crate::schema::{project_secret, projects, secrets};
 
-    let access: Vec<MachineAccountProjectAccess> = mapa::table
-        .filter(mapa::machine_account_id.eq(ma_id))
-        .load(conn)?;
-    let can_write: HashMap<String, bool> = access
+    let readable: Vec<String> = rights
         .iter()
-        .map(|a| (a.project_id.clone(), a.can_write != 0))
+        .filter(|(_, r)| r.read)
+        .map(|(id, _)| id.clone())
         .collect();
-    let readable: Vec<String> = access
+    let can_write: HashMap<String, bool> = rights
         .iter()
-        .filter(|a| a.can_read != 0)
-        .map(|a| a.project_id.clone())
+        .map(|(id, r)| (id.clone(), r.write))
         .collect();
 
     let projs: Vec<Project> = projects::table
@@ -129,11 +121,21 @@ fn load_accessible(conn: &mut SqliteConnection, ma_id: &str) -> anyhow::Result<A
     })
 }
 
-async fn load(pool: &State<DbPool>, ma_id: String) -> Result<Accessible, Status> {
+/// Resolve the principal's accessible set, optionally restricted to one organization.
+async fn load(
+    pool: &State<DbPool>,
+    principal: Principal,
+    org_filter: Option<String>,
+) -> Result<Accessible, Status> {
     let pool = pool.inner().clone();
     rocket::tokio::task::spawn_blocking(move || {
         let mut conn = pool.get()?;
-        load_accessible(&mut conn, &ma_id)
+        let access = principal.project_access(&mut conn)?;
+        let rights = match &org_filter {
+            Some(org) => rights_in_org(&access, org),
+            None => rights_all(&access),
+        };
+        load_accessible(&mut conn, &rights)
     })
     .await
     .map_err(|_| Status::InternalServerError)?
@@ -175,13 +177,13 @@ fn secret_response(s: &Secret, projects: Vec<ProjectRef>, write: bool) -> Secret
 #[get("/organizations/<org_id>/secrets")]
 pub async fn list_secrets(
     org_id: String,
-    auth: SmAuth,
+    principal: Principal,
     pool: &State<DbPool>,
 ) -> Result<Json<SecretsListResponse>, Status> {
-    if auth.organization_id != org_id {
+    if principal.org_access(&org_id).is_none() {
         return Err(Status::NotFound);
     }
-    let acc = load(pool, auth.machine_account_id.clone()).await?;
+    let acc = load(pool, principal, Some(org_id)).await?;
 
     let secrets = acc
         .secrets
@@ -207,10 +209,10 @@ pub async fn list_secrets(
 #[get("/secrets/<id>")]
 pub async fn get_secret(
     id: String,
-    auth: SmAuth,
+    principal: Principal,
     pool: &State<DbPool>,
 ) -> Result<Json<SecretResponse>, Status> {
-    let acc = load(pool, auth.machine_account_id.clone()).await?;
+    let acc = load(pool, principal, None).await?;
     let Some(s) = acc.secrets.iter().find(|s| s.id == id) else {
         return Err(Status::NotFound);
     };
@@ -222,13 +224,13 @@ pub async fn get_secret(
 #[get("/organizations/<org_id>/secrets/sync")]
 pub async fn sync(
     org_id: String,
-    auth: SmAuth,
+    principal: Principal,
     pool: &State<DbPool>,
 ) -> Result<Json<SyncResponse>, Status> {
-    if auth.organization_id != org_id {
+    if principal.org_access(&org_id).is_none() {
         return Err(Status::NotFound);
     }
-    let acc = load(pool, auth.machine_account_id.clone()).await?;
+    let acc = load(pool, principal, Some(org_id)).await?;
 
     let data: Vec<BaseSecret> = acc
         .secrets
@@ -248,13 +250,17 @@ pub async fn sync(
 #[post("/organizations/<org_id>/secrets", data = "<req>")]
 pub async fn create_secret(
     org_id: String,
-    auth: SmAuth,
+    principal: Principal,
     req: Json<SecretCreateRequest>,
     pool: &State<DbPool>,
 ) -> Result<Json<SecretResponse>, Status> {
-    if auth.organization_id != org_id {
+    let Some(org) = principal.org_access(&org_id) else {
         return Err(Status::NotFound);
-    }
+    };
+    // A secret with no project can only be created by a machine account or an Owner/Admin; a
+    // regular member must place secrets in a project they can write.
+    let privileged = matches!(principal, Principal::Machine { .. }) || org.is_admin;
+
     let project_id = req
         .project_ids
         .clone()
@@ -263,7 +269,6 @@ pub async fn create_secret(
         .next();
 
     let pool = pool.inner().clone();
-    let ma = auth.machine_account_id.clone();
     let key = req.key.clone();
     let value = req.value.clone();
     let note = req.note.clone();
@@ -273,9 +278,16 @@ pub async fn create_secret(
             use crate::schema::{project_secret, projects, secrets};
             let mut conn = pool.get()?;
 
+            let access = principal.project_access(&mut conn)?;
+            let writable: HashSet<String> = rights_in_org(&access, &org_id)
+                .into_iter()
+                .filter(|(_, r)| r.write)
+                .map(|(id, _)| id)
+                .collect();
+
             let mut project_ref = None;
             if let Some(pid) = &project_id {
-                if !writable_project_ids(&mut conn, &ma)?.contains(pid) {
+                if !writable.contains(pid) {
                     anyhow::bail!("no write access to project");
                 }
                 let name: Option<String> = projects::table
@@ -289,6 +301,8 @@ pub async fn create_secret(
                         name,
                     });
                 }
+            } else if !privileged {
+                anyhow::bail!("members cannot create unassigned secrets");
             }
 
             let id = uuid::Uuid::new_v4().to_string();
@@ -331,12 +345,11 @@ pub async fn create_secret(
 #[put("/secrets/<id>", data = "<req>")]
 pub async fn update_secret(
     id: String,
-    auth: SmAuth,
+    principal: Principal,
     req: Json<SecretUpdateRequest>,
     pool: &State<DbPool>,
 ) -> Result<Json<SecretResponse>, Status> {
     let pool = pool.inner().clone();
-    let ma = auth.machine_account_id.clone();
     let key = req.key.clone();
     let value = req.value.clone();
     let note = req.note.clone();
@@ -347,7 +360,9 @@ pub async fn update_secret(
             use crate::schema::{project_secret, secrets};
             let mut conn = pool.get()?;
 
-            let acc = load_accessible(&mut conn, &ma)?;
+            let access = principal.project_access(&mut conn)?;
+            let rights = rights_all(&access);
+            let acc = load_accessible(&mut conn, &rights)?;
             if !acc.secrets.iter().any(|s| s.id == id) {
                 anyhow::bail!("not found");
             }
@@ -369,14 +384,12 @@ pub async fn update_secret(
             if let Some(pids) = &project_ids {
                 let target = pids.first().cloned();
                 if let Some(ref pid) = target {
-                    if !writable_project_ids(&mut conn, &ma)?.contains(pid) {
+                    if !rights.get(pid).map(|r| r.write).unwrap_or(false) {
                         anyhow::bail!("no write access to target project");
                     }
                 }
-                diesel::delete(
-                    project_secret::table.filter(project_secret::secret_id.eq(&id)),
-                )
-                .execute(&mut conn)?;
+                diesel::delete(project_secret::table.filter(project_secret::secret_id.eq(&id)))
+                    .execute(&mut conn)?;
                 if let Some(pid) = target {
                     diesel::insert_into(project_secret::table)
                         .values(&ProjectSecret {
@@ -388,7 +401,7 @@ pub async fn update_secret(
             }
 
             let updated: Secret = secrets::table.find(&id).first(&mut conn)?;
-            let after = load_accessible(&mut conn, &ma)?;
+            let after = load_accessible(&mut conn, &rights)?;
             let projects = after.secret_projects.get(&id).cloned().unwrap_or_default();
             Ok((updated, projects))
         },
@@ -402,19 +415,20 @@ pub async fn update_secret(
 
 #[post("/secrets/delete", data = "<ids>")]
 pub async fn delete_secrets(
-    auth: SmAuth,
+    principal: Principal,
     ids: Json<Vec<String>>,
     pool: &State<DbPool>,
 ) -> Result<Json<ListResponse<BulkDeleteResponse>>, Status> {
     let pool = pool.inner().clone();
-    let ma = auth.machine_account_id.clone();
     let ids = ids.into_inner();
 
     let responses = rocket::tokio::task::spawn_blocking(
         move || -> anyhow::Result<Vec<BulkDeleteResponse>> {
             use crate::schema::secrets;
             let mut conn = pool.get()?;
-            let acc = load_accessible(&mut conn, &ma)?;
+
+            let access = principal.project_access(&mut conn)?;
+            let acc = load_accessible(&mut conn, &rights_all(&access))?;
             let writable: HashSet<String> = acc
                 .secrets
                 .iter()
@@ -454,12 +468,12 @@ pub async fn delete_secrets(
 
 #[post("/secrets/get-by-ids", data = "<req>")]
 pub async fn get_secrets_by_ids(
-    auth: SmAuth,
+    principal: Principal,
     req: Json<GetByIdsRequest>,
     pool: &State<DbPool>,
 ) -> Result<Json<ListResponse<BaseSecret>>, Status> {
     let wanted: HashSet<String> = req.into_inner().ids.into_iter().collect();
-    let acc = load(pool, auth.machine_account_id.clone()).await?;
+    let acc = load(pool, principal, None).await?;
 
     let data: Vec<BaseSecret> = acc
         .secrets

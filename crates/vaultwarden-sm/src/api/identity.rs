@@ -2,14 +2,12 @@
 //!
 //! Mounted under `/identity`, so the route is `POST /identity/connect/token`.
 
-use base64::{engine::general_purpose::STANDARD, Engine};
 use diesel::prelude::*;
 use rocket::form::Form;
 use rocket::http::Status;
 use rocket::serde::json::Json;
 use rocket::{post, routes, FromForm, Route, State};
 use serde::Serialize;
-use sha2::{Digest, Sha256};
 use subtle::ConstantTimeEq;
 
 use crate::db::DbPool;
@@ -73,7 +71,7 @@ pub async fn connect_token(
     let (token, ma) = looked_up.map_err(|_| Status::Unauthorized)?;
 
     // Verify the client secret: Base64(SHA256(secret)) == stored hash, constant-time.
-    let computed = STANDARD.encode(Sha256::digest(req.client_secret.as_bytes()));
+    let computed = sm_core::crypto::hash_client_secret(&req.client_secret);
     if computed
         .as_bytes()
         .ct_eq(token.client_secret_hash.as_bytes())

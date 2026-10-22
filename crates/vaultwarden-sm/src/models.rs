@@ -78,3 +78,21 @@ pub struct MachineAccountProjectAccess {
     pub can_read: i32,
     pub can_write: i32,
 }
+
+#[derive(Queryable, Insertable, Debug, Clone)]
+#[diesel(table_name = user_project_access)]
+pub struct UserProjectAccess {
+    pub user_id: String,
+    pub project_id: String,
+    pub can_read: i32,
+    pub can_write: i32,
+}
+
+#[derive(Queryable, Insertable, Debug, Clone)]
+#[diesel(table_name = user_machine_account_access)]
+pub struct UserMachineAccountAccess {
+    pub user_id: String,
+    pub machine_account_id: String,
+    pub can_read: i32,
+    pub can_write: i32,
+}
