@@ -1,6 +1,6 @@
-target
-data
+/target
+/data
+.git
 **/*.db
 **/*.sqlite3*
-.git
 *.key
