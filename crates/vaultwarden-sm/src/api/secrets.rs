@@ -25,6 +25,7 @@ use crate::models::{Project, ProjectSecret, Secret};
 pub fn routes() -> Vec<Route> {
     routes![
         list_secrets,
+        list_project_secrets,
         get_secret,
         sync,
         create_secret,
@@ -237,25 +238,49 @@ pub async fn list_secrets(
     }
     let acc = load(pool, principal, Some(org_id)).await?;
 
-    let secrets = acc
-        .secrets
-        .iter()
-        .map(|s| SecretListItem {
-            id: s.id.clone(),
-            organization_id: s.organization_id.clone(),
-            key: s.key_enc.clone(),
-            creation_date: s.creation_date.clone(),
-            revision_date: s.revision_date.clone(),
-            projects: acc.secret_projects.get(&s.id).cloned().unwrap_or_default(),
-            read: true,
-            write: *acc.secret_write.get(&s.id).unwrap_or(&false),
-        })
-        .collect();
-
+    let secrets = acc.secrets.iter().map(|s| list_item(&acc, s)).collect();
     Ok(Json(SecretsListResponse {
         secrets,
         projects: acc.projects,
     }))
+}
+
+/// The secrets of one project (`bws secret list <PROJECT_ID>`), in the organization list's shape.
+/// A project the principal cannot read is a 404, like any other resource it may not see.
+#[get("/projects/<id>/secrets")]
+pub async fn list_project_secrets(
+    id: String,
+    principal: Principal,
+    pool: &State<DbPool>,
+) -> Result<Json<SecretsListResponse>, Status> {
+    let acc = load(pool, principal, None).await?;
+    let Some(project) = acc.projects.iter().find(|p| p.id == id).cloned() else {
+        return Err(Status::NotFound);
+    };
+
+    let in_project = |s: &&Secret| {
+        acc.secret_projects
+            .get(&s.id)
+            .is_some_and(|ps| ps.iter().any(|p| p.id == id))
+    };
+    let secrets = acc.secrets.iter().filter(in_project).map(|s| list_item(&acc, s)).collect();
+    Ok(Json(SecretsListResponse {
+        secrets,
+        projects: vec![project],
+    }))
+}
+
+fn list_item(acc: &Accessible, s: &Secret) -> SecretListItem {
+    SecretListItem {
+        id: s.id.clone(),
+        organization_id: s.organization_id.clone(),
+        key: s.key_enc.clone(),
+        creation_date: s.creation_date.clone(),
+        revision_date: s.revision_date.clone(),
+        projects: acc.secret_projects.get(&s.id).cloned().unwrap_or_default(),
+        read: true,
+        write: *acc.secret_write.get(&s.id).unwrap_or(&false),
+    }
 }
 
 #[get("/secrets/<id>")]

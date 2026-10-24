@@ -385,6 +385,34 @@ mod tests {
     }
 
     #[test]
+    fn list_project_secrets_for_bws() {
+        let client = test_client("projsecrets");
+        let pool = client.rocket().state::<db::DbPool>().unwrap();
+        seed_project(pool);
+        seed_secret(pool);
+        let token = obtain_token(&client);
+        let bearer = Header::new("Authorization", format!("Bearer {token}"));
+
+        // `bws secret list <PROJECT_ID>`: the project's secrets, in the organization list's shape.
+        let resp = client
+            .get(format!("/api/projects/{PROJECT_ID}/secrets"))
+            .header(bearer.clone())
+            .dispatch();
+        assert_eq!(resp.status(), Status::Ok);
+        let body: serde_json::Value = resp.into_json().unwrap();
+        assert_eq!(body["secrets"][0]["id"], SECRET_ID);
+        assert!(body["secrets"][0].get("value").is_none());
+        assert_eq!(body["projects"][0]["id"], PROJECT_ID);
+
+        // A project the token cannot see is a 404.
+        let resp = client
+            .get("/api/projects/00000000-0000-0000-0000-000000000000/secrets")
+            .header(bearer)
+            .dispatch();
+        assert_eq!(resp.status(), Status::NotFound);
+    }
+
+    #[test]
     fn get_secret_includes_value() {
         let client = test_client("secget");
         let pool = client.rocket().state::<db::DbPool>().unwrap();
