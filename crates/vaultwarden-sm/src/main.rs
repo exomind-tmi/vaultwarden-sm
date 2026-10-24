@@ -1132,4 +1132,145 @@ mod tests {
             .dispatch();
         assert_eq!(resp.status(), Status::Forbidden);
     }
+
+    /// Ids of the secrets the organization's secret list shows the bearer.
+    fn listed_secret_ids(client: &Client, bearer: &Header<'static>) -> Vec<String> {
+        let resp = client
+            .get(format!("/api/organizations/{ORG_ID}/secrets"))
+            .header(bearer.clone())
+            .dispatch();
+        assert_eq!(resp.status(), Status::Ok);
+        let body: serde_json::Value = resp.into_json().unwrap();
+        body["secrets"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|s| s["id"].as_str().unwrap().to_string())
+            .collect()
+    }
+
+    fn create_secret_as(client: &Client, bearer: &Header<'static>, project_ids: &str) -> String {
+        let resp = client
+            .post(format!("/api/organizations/{ORG_ID}/secrets"))
+            .header(bearer.clone())
+            .header(ContentType::JSON)
+            .body(format!(
+                r#"{{"key":"2.k|k|k","value":"2.v|v|v","note":"","projectIds":[{project_ids}]}}"#
+            ))
+            .dispatch();
+        assert_eq!(resp.status(), Status::Ok);
+        let body: serde_json::Value = resp.into_json().unwrap();
+        body["id"].as_str().unwrap().to_string()
+    }
+
+    #[test]
+    fn admin_sees_secrets_without_a_project() {
+        let pem = fed_key_pem();
+        let sub = "dddddddd-1111-2222-3333-444444444444";
+        let vw = start_profile_stub(profile_json(sub, 1)); // type 1 = Admin
+        let client = fed_client("admin-unassigned", &pem, &vw);
+        let bearer = Header::new("Authorization", format!("Bearer {}", sign_user_token(&pem, sub)));
+
+        let unassigned = create_secret_as(&client, &bearer, "");
+        let in_project = create_secret_as(&client, &bearer, &format!(r#""{PROJECT_ID}""#));
+
+        // Deleting the project orphans its secret; the admin must still reach both.
+        let resp = client
+            .post("/api/projects/delete")
+            .header(bearer.clone())
+            .header(ContentType::JSON)
+            .body(format!(r#"["{PROJECT_ID}"]"#))
+            .dispatch();
+        assert_eq!(resp.status(), Status::Ok);
+
+        let mut listed = listed_secret_ids(&client, &bearer);
+        listed.sort();
+        let mut expected = vec![unassigned.clone(), in_project.clone()];
+        expected.sort();
+        assert_eq!(listed, expected);
+
+        // The count agrees with the list.
+        let resp = client
+            .get(format!("/api/organizations/{ORG_ID}/sm-counts"))
+            .header(bearer.clone())
+            .dispatch();
+        let counts: serde_json::Value = resp.into_json().unwrap();
+        assert_eq!(counts["secrets"], 2);
+
+        // Both open with write rights and no project.
+        for id in [&unassigned, &in_project] {
+            let resp = client.get(format!("/api/secrets/{id}")).header(bearer.clone()).dispatch();
+            assert_eq!(resp.status(), Status::Ok);
+            let body: serde_json::Value = resp.into_json().unwrap();
+            assert_eq!(body["write"], true);
+            assert_eq!(body["projects"].as_array().unwrap().len(), 0);
+        }
+
+        // ...and can be edited and deleted.
+        let resp = client
+            .put(format!("/api/secrets/{unassigned}"))
+            .header(bearer.clone())
+            .header(ContentType::JSON)
+            .body(r#"{"key":"2.k2|k|k","value":"2.v|v|v","note":""}"#)
+            .dispatch();
+        assert_eq!(resp.status(), Status::Ok);
+
+        let resp = client
+            .post("/api/secrets/delete")
+            .header(bearer.clone())
+            .header(ContentType::JSON)
+            .body(format!(r#"["{unassigned}","{in_project}"]"#))
+            .dispatch();
+        let body: serde_json::Value = resp.into_json().unwrap();
+        assert!(body["data"].as_array().unwrap().iter().all(|r| r["error"].is_null()));
+        assert!(listed_secret_ids(&client, &bearer).is_empty());
+    }
+
+    #[test]
+    fn member_does_not_see_secrets_without_a_project() {
+        let pem = fed_key_pem();
+        let sub = "eeeeeeee-1111-2222-3333-444444444444";
+        let vw = start_profile_stub(profile_json(sub, 2)); // type 2 = regular User (member)
+        let client = fed_client("member-unassigned", &pem, &vw);
+
+        // An unassigned secret (as an admin would create) and a project grant for the member.
+        let unassigned = "ffffffff-1111-2222-3333-444444444444";
+        {
+            use crate::schema::{secrets, user_project_access as upa};
+            let mut conn = client.rocket().state::<db::DbPool>().unwrap().get().unwrap();
+            let now = "2026-10-22T00:00:00Z".to_string();
+            diesel::insert_into(secrets::table)
+                .values(&Secret {
+                    id: unassigned.into(),
+                    organization_id: ORG_ID.into(),
+                    key_enc: "2.k|k|k".into(),
+                    value_enc: "2.v|v|v".into(),
+                    note_enc: None,
+                    creation_date: now.clone(),
+                    revision_date: now,
+                    deleted_date: None,
+                })
+                .execute(&mut conn)
+                .unwrap();
+            diesel::insert_into(upa::table)
+                .values(&crate::models::UserProjectAccess {
+                    user_id: sub.into(),
+                    project_id: PROJECT_ID.into(),
+                    can_read: 1,
+                    can_write: 1,
+                })
+                .execute(&mut conn)
+                .unwrap();
+        }
+        let bearer = Header::new("Authorization", format!("Bearer {}", sign_user_token(&pem, sub)));
+
+        let in_project = create_secret_as(&client, &bearer, &format!(r#""{PROJECT_ID}""#));
+        assert_eq!(listed_secret_ids(&client, &bearer), [in_project]);
+
+        let resp = client
+            .get(format!("/api/secrets/{unassigned}"))
+            .header(bearer)
+            .dispatch();
+        assert_eq!(resp.status(), Status::NotFound);
+    }
 }

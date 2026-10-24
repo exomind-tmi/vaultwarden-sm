@@ -3,7 +3,6 @@
 //! Every count is scoped to what the caller may actually see, so an admin and a member looking at
 //! the same organization can get different numbers — exactly what each is allowed to reach.
 
-use diesel::prelude::*;
 use rocket::http::Status;
 use rocket::serde::json::Json;
 use rocket::{get, routes, Route, State};
@@ -29,7 +28,6 @@ pub async fn organization_counts(
 
     let counts = rocket::tokio::task::spawn_blocking(
         move || -> anyhow::Result<(i64, i64, i64)> {
-            use crate::schema::{project_secret as ps, secrets};
             let mut conn = pool.get()?;
 
             // Projects and service accounts: the readable ones in this organization.
@@ -45,22 +43,8 @@ pub async fn organization_counts(
                 .filter(|r| r.read)
                 .count() as i64;
 
-            // Secrets: distinct non-deleted secrets reachable through those readable projects.
-            let secrets = if readable_projects.is_empty() {
-                0
-            } else {
-                let ids: Vec<String> = ps::table
-                    .inner_join(secrets::table.on(secrets::id.eq(ps::secret_id)))
-                    .filter(
-                        ps::project_id
-                            .eq_any(&readable_projects)
-                            .and(secrets::deleted_date.is_null()),
-                    )
-                    .select(ps::secret_id)
-                    .distinct()
-                    .load::<String>(&mut conn)?;
-                ids.len() as i64
-            };
+            // Secrets: exactly what the secret list shows this caller.
+            let secrets = crate::api::secrets::count_in_org(&mut conn, &principal, &org_id)?;
 
             Ok((readable_projects.len() as i64, secrets, service_accounts))
         },

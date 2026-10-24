@@ -1,8 +1,10 @@
 //! Secrets Manager secret routes: list, get, sync, and CRUD.
 //!
 //! A principal reaches secrets through the projects it can read; writing needs a project it can
-//! write. Access is resolved once per request via [`crate::access`]. Denials return 404, not 403,
-//! so a token cannot even learn that a secret it may not see exists.
+//! write. An Owner/Admin additionally reaches every secret of the organization, read and write —
+//! including one with no project or whose project was deleted, which nobody else can reach. Access
+//! is resolved once per request via [`crate::access`]. Denials return 404, not 403, so a token
+//! cannot even learn that a secret it may not see exists.
 
 use std::collections::{HashMap, HashSet};
 
@@ -36,7 +38,35 @@ fn now_iso() -> String {
     chrono::Utc::now().to_rfc3339_opts(chrono::SecondsFormat::Micros, true)
 }
 
-/// Everything a principal can reach, resolved once per request from a project-rights map.
+/// What a principal may reach: its rights on projects, and the organizations where it is an
+/// Owner/Admin and so reaches every secret.
+struct Scope {
+    rights: HashMap<String, Rights>,
+    admin_orgs: Vec<String>,
+}
+
+impl Scope {
+    /// Resolve the principal's scope, optionally restricted to one organization.
+    fn resolve(
+        conn: &mut SqliteConnection,
+        principal: &Principal,
+        org_filter: Option<&str>,
+    ) -> anyhow::Result<Self> {
+        let access = principal.project_access(conn)?;
+        let rights = match org_filter {
+            Some(org) => rights_in_org(&access, org),
+            None => rights_all(&access),
+        };
+        let admin_orgs = principal
+            .admin_org_ids()
+            .into_iter()
+            .filter(|org| org_filter.is_none_or(|f| f == org))
+            .collect();
+        Ok(Self { rights, admin_orgs })
+    }
+}
+
+/// Everything a principal can reach, resolved once per request from its [`Scope`].
 struct Accessible {
     secrets: Vec<Secret>,
     secret_projects: HashMap<String, Vec<ProjectRef>>,
@@ -44,12 +74,10 @@ struct Accessible {
     projects: Vec<ProjectRef>,
 }
 
-fn load_accessible(
-    conn: &mut SqliteConnection,
-    rights: &HashMap<String, Rights>,
-) -> anyhow::Result<Accessible> {
+fn load_accessible(conn: &mut SqliteConnection, scope: &Scope) -> anyhow::Result<Accessible> {
     use crate::schema::{project_secret, projects, secrets};
 
+    let rights = &scope.rights;
     let readable: Vec<String> = rights
         .iter()
         .filter(|(_, r)| r.read)
@@ -105,7 +133,7 @@ fn load_accessible(
         }
     }
 
-    let secrets_rows: Vec<Secret> = secrets::table
+    let mut secrets_rows: Vec<Secret> = secrets::table
         .filter(
             secrets::id
                 .eq_any(&secret_ids)
@@ -113,12 +141,40 @@ fn load_accessible(
         )
         .load(conn)?;
 
+    // An Owner/Admin also reaches the secrets no readable project leads to: those with no project,
+    // and those whose project was deleted. They come with full rights and no project.
+    if !scope.admin_orgs.is_empty() {
+        let rest: Vec<Secret> = secrets::table
+            .filter(
+                secrets::organization_id
+                    .eq_any(&scope.admin_orgs)
+                    .and(secrets::deleted_date.is_null())
+                    .and(secrets::id.ne_all(&secret_ids)),
+            )
+            .load(conn)?;
+        for s in &rest {
+            secret_write.insert(s.id.clone(), true);
+        }
+        secrets_rows.extend(rest);
+    }
+
     Ok(Accessible {
         secrets: secrets_rows,
         secret_projects,
         secret_write,
         projects: project_refs,
     })
+}
+
+/// How many secrets the principal reaches in one organization, by the same rules as the secret
+/// list (the `sm-counts` tally).
+pub(crate) fn count_in_org(
+    conn: &mut SqliteConnection,
+    principal: &Principal,
+    org_id: &str,
+) -> anyhow::Result<i64> {
+    let scope = Scope::resolve(conn, principal, Some(org_id))?;
+    Ok(load_accessible(conn, &scope)?.secrets.len() as i64)
 }
 
 /// Resolve the principal's accessible set, optionally restricted to one organization.
@@ -130,12 +186,8 @@ async fn load(
     let pool = pool.inner().clone();
     rocket::tokio::task::spawn_blocking(move || {
         let mut conn = pool.get()?;
-        let access = principal.project_access(&mut conn)?;
-        let rights = match &org_filter {
-            Some(org) => rights_in_org(&access, org),
-            None => rights_all(&access),
-        };
-        load_accessible(&mut conn, &rights)
+        let scope = Scope::resolve(&mut conn, &principal, org_filter.as_deref())?;
+        load_accessible(&mut conn, &scope)
     })
     .await
     .map_err(|_| Status::InternalServerError)?
@@ -363,9 +415,8 @@ pub async fn update_secret(
             use crate::schema::{project_secret, secrets};
             let mut conn = pool.get()?;
 
-            let access = principal.project_access(&mut conn)?;
-            let rights = rights_all(&access);
-            let acc = load_accessible(&mut conn, &rights)?;
+            let scope = Scope::resolve(&mut conn, &principal, None)?;
+            let acc = load_accessible(&mut conn, &scope)?;
             if !acc.secrets.iter().any(|s| s.id == id) {
                 anyhow::bail!("not found");
             }
@@ -387,7 +438,7 @@ pub async fn update_secret(
             if let Some(pids) = &project_ids {
                 let target = pids.first().cloned();
                 if let Some(ref pid) = target {
-                    if !rights.get(pid).map(|r| r.write).unwrap_or(false) {
+                    if !scope.rights.get(pid).map(|r| r.write).unwrap_or(false) {
                         anyhow::bail!("no write access to target project");
                     }
                 }
@@ -404,7 +455,7 @@ pub async fn update_secret(
             }
 
             let updated: Secret = secrets::table.find(&id).first(&mut conn)?;
-            let after = load_accessible(&mut conn, &rights)?;
+            let after = load_accessible(&mut conn, &scope)?;
             let projects = after.secret_projects.get(&id).cloned().unwrap_or_default();
             Ok((updated, projects))
         },
@@ -430,8 +481,8 @@ pub async fn delete_secrets(
             use crate::schema::secrets;
             let mut conn = pool.get()?;
 
-            let access = principal.project_access(&mut conn)?;
-            let acc = load_accessible(&mut conn, &rights_all(&access))?;
+            let scope = Scope::resolve(&mut conn, &principal, None)?;
+            let acc = load_accessible(&mut conn, &scope)?;
             let writable: HashSet<String> = acc
                 .secrets
                 .iter()

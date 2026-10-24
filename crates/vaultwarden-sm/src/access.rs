@@ -9,8 +9,10 @@
 //!    (`user_project_access`).
 //!
 //! Both collapse to the one question the handlers ask — "which projects can this principal read or
-//! write?" — answered by [`Principal::project_access`]. Secrets are always reached through their
-//! projects, so project rights are sufficient. The same machinery answers the parallel question for
+//! write?" — answered by [`Principal::project_access`]. Secrets are reached through their projects,
+//! except for an Owner/Admin, who sees every secret of the organization
+//! ([`Principal::admin_org_ids`]) — including one with no project, or whose project was deleted.
+//! The same machinery answers the parallel question for
 //! machine accounts ([`Principal::machine_account_access`]) so the service-account endpoints share
 //! one authorization model.
 
@@ -70,6 +72,15 @@ impl Principal {
                 .map(|m| OrgAccess {
                     is_admin: m.role == OrgRole::Admin,
                 }),
+        }
+    }
+
+    /// The organizations where this principal is an Owner/Admin and so sees every secret, not just
+    /// those reachable through its projects. A machine account has none.
+    pub fn admin_org_ids(&self) -> Vec<String> {
+        match self {
+            Principal::Machine { .. } => Vec::new(),
+            Principal::User { memberships, .. } => admin_orgs(memberships),
         }
     }
 
